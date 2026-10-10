@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 0077
+
+BACKUP_DIR=/var/lib/srdq/backups
+PG_SOCKET=/run/srdq-pg
+PG_BIN=/opt/srdq/postgresql/current/pgserver/pginstall/bin
+RETENTION_DAYS=${SRDQ_BACKUP_RETENTION_DAYS:-14}
+NO_LOCK=false
+LABEL=scheduled
+
+while (($#)); do
+  case "$1" in
+    --no-lock) NO_LOCK=true ;;
+    --label) shift; LABEL=${1:?--label needs a value} ;;
+    *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ $LABEL =~ ^[0-9A-Za-z._-]+$ ]] || { echo "invalid backup label" >&2; exit 2; }
+
+if ! $NO_LOCK; then
+  exec 9>/run/srdq-deploy.lock
+  flock -n 9 || { echo "deployment or another backup is in progress" >&2; exit 1; }
+fi
+
+install -d -o srdq-pg -g srdq-pg -m 0700 "$BACKUP_DIR"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+output="$BACKUP_DIR/${stamp}-${LABEL}.dump"
+temp="${output}.tmp.$$"
+trap 'rm -f "$temp"' EXIT
+runuser -u srdq-pg -- "$PG_BIN/pg_dump" -h "$PG_SOCKET" --format=custom --file="$temp" srdq
+chown srdq-pg:srdq-pg "$temp"
+chmod 0600 "$temp"
+mv "$temp" "$output"
+trap - EXIT
+find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.dump' -mtime "+$RETENTION_DAYS" -delete
+printf '%s\n' "$output"

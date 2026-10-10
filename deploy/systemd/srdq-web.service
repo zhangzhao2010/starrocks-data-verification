@@ -1,14 +1,16 @@
 [Unit]
 Description=srdq web dashboard and REST API (127.0.0.1:8470, reach it through an SSH tunnel)
-After=network-online.target postgresql.service srdq-controller.service
+Requires=srdq-pg.service
+After=network-online.target srdq-pg.service srdq-controller.service
 Wants=srdq-controller.service
 
 [Service]
 Type=simple
 User=srdq-ctl
-Group=srdq-ctl
+Group=srdq
+SupplementaryGroups=srdq-pg
 Environment=SRDQ_CONFIG=/etc/srdq/config.yaml
-ExecStart=/opt/srdq/venv/bin/srdq web
+ExecStart=/opt/srdq/current/venv/bin/srdq web
 Restart=on-failure
 RestartSec=5
 UMask=0077

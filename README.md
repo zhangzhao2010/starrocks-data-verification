@@ -68,82 +68,91 @@ uv run python scripts/demo.py     # 本地演示，数据目录默认 /tmp/srdq-
 
 按 Ctrl-C 停止。再次运行时会复用已有数据；需要重置时，删除 `/tmp/srdq-demo`。
 
-## 部署（单台阿里 ECS，CENTRAL 模式）
+## 离线部署（Alibaba Cloud Linux 4 x86_64，CENTRAL 模式）
 
-1. **准备系统用户和目录**
+离线包固定目标为 CPython 3.11、x86_64、glibc 2.17+，包含应用及依赖 wheel、PostgreSQL 16 二进制、systemd unit 和部署脚本。生产机不需要外网、uv、pip 或单独安装 PostgreSQL；需要带 `venv` 模块的 Python 3.11、systemd 和 root 权限。
 
-   ```bash
-   groupadd srdq
-   for u in srdq-ctl srdq-hw srdq-al; do useradd -r -g srdq -s /sbin/nologin $u; done
-   install -d -o root -g srdq -m 0750 /etc/srdq /etc/srdq/secrets
-   install -d -o srdq-ctl -g srdq -m 0700 /var/lib/srdq/controller /var/lib/srdq/reports
-   install -d -o srdq-hw  -g srdq -m 0700 /var/lib/srdq/executor/huawei
-   install -d -o srdq-al  -g srdq -m 0700 /var/lib/srdq/executor/aliyun
-   chmod 0755 /var/lib/srdq /var/lib/srdq/executor
+1. **在有外网的 x86_64 Linux 构建机准备生产配置**
+
+   在仓库之外创建权限为 0700 的目录，结构固定如下：
+
+   ```text
+   /secure/srdq-prod/
+   ├── config.yaml
+   └── secrets/
+       ├── huawei.json
+       ├── aliyun.json
+       ├── huawei-ca.pem    # 使用自定义 CA 时才需要
+       └── aliyun-ca.pem
    ```
 
-2. **安装**
+   - `config.yaml` 可从 `deploy/config.example.yaml` 复制，必须设置 `run_enabled: true`、真实的 `transfer.global_approval_ref` 和生产连接信息；两侧凭证路径必须分别是 `/etc/srdq/secrets/huawei.json`、`/etc/srdq/secrets/aliyun.json`。
+   - 两个 JSON 可参考 `deploy/secrets/side.json.example`，填写只读 StarRocks 账号，但删除 `worker_token`；安装程序会生成令牌并安全写入。
+   - `ssl_ca` 如有配置，必须指向 `/etc/srdq/secrets/` 下同时打包的 CA 文件。
+
+2. **构建包含生产配置的离线包**
 
    ```bash
-   uv venv /opt/srdq/venv && uv pip install --python /opt/srdq/venv .
+   ./scripts/build-offline-bundle.sh --provision-dir /secure/srdq-prod
+   (cd dist && sha256sum -c srdq-offline-*-alinux4-x86_64.tar.gz.sha256)
    ```
 
-3. **配置**
-   - 把 `deploy/config.example.yaml` 复制为 `/etc/srdq/config.yaml`，属主 root:srdq，权限 0640。
-   - 首次部署时保持 `run_enabled: false`。
-   - 在 `transfer.global_approval_ref` 登记客户的书面审批编号。没有审批编号时，METRIC / SAMPLE 保持 BLOCKED。
+   每次发布必须先递增 `pyproject.toml` 的 `project.version` 并执行 `uv lock`。构建脚本会校验配置、拒绝占位值及预置 worker token。产物包含生产密码，压缩包和校验文件强制为 0600，只能通过受控通道传输，不能提交到 Git 或普通制品库。
 
-4. **准备凭证文件**（都是 0600，属主分别为对应用户）
-   - `/etc/srdq/secrets/pg.json`：属主 srdq-ctl，格式见 `deploy/secrets/pg.json.example`。
-   - `/etc/srdq/secrets/huawei.json`：属主 srdq-hw，格式见 `deploy/secrets/side.json.example`。
-   - `/etc/srdq/secrets/aliyun.json`：属主 srdq-al。
-   - SR 账号只授予 SELECT 权限。
-
-5. **初始化数据库并签发执行器令牌**
-
-   令牌只显示一次，控制库里只保存它的 sha256。把令牌写进对应 side 凭证文件的 `worker_token` 字段，然后删除临时文件。
+3. **经跳板机传输并一键安装**
 
    ```bash
-   sudo -u srdq-ctl SRDQ_CONFIG=/etc/srdq/config.yaml /opt/srdq/venv/bin/srdq check-config
-   sudo -u srdq-ctl SRDQ_CONFIG=/etc/srdq/config.yaml /opt/srdq/venv/bin/srdq migrate
-   sudo -u srdq-ctl SRDQ_CONFIG=/etc/srdq/config.yaml /opt/srdq/venv/bin/srdq worker-token create --name hw-1 --side huawei --out /tmp/hw.token
-   sudo -u srdq-ctl SRDQ_CONFIG=/etc/srdq/config.yaml /opt/srdq/venv/bin/srdq worker-token create --name al-1 --side aliyun --out /tmp/al.token
+   scp -J <user>@<jump-host> dist/srdq-offline-*.tar.gz* <user>@<ecs>:/tmp/
+   # 在 ECS 上：
+   cd /tmp
+   VERSION=0.1.0
+   sha256sum -c "srdq-offline-${VERSION}-alinux4-x86_64.tar.gz.sha256"
+   tar xzf "srdq-offline-${VERSION}-alinux4-x86_64.tar.gz"
+   sudo "./srdq-offline-${VERSION}/deploy/install.sh"
    ```
 
-6. **安装并启动 systemd 服务**
+   安装脚本自动写入配置和凭证、创建隔离用户、初始化仅开放 Unix socket 的 PostgreSQL、迁移数据库、生成执行器令牌，并立即启动 controller、web、两个 executor 和每日备份 timer。生产机不需要再编辑文件或执行初始化命令。安装成功后应删除 `/tmp` 中含凭证的压缩包和解压目录。
+
+   程序安装到 `/opt/srdq/releases/<版本>`，`/opt/srdq/current` 原子指向当前版本；数据库和历史数据保存在 `/var/lib/srdq`，不会随代码替换。PostgreSQL 凭证由安装脚本生成，不含密码，只允许 `srdq-ctl` 通过本机 socket 使用。
+
+4. **访问看板**
 
    ```bash
-   cp -r deploy/systemd/* /etc/systemd/system/ && systemctl daemon-reload
-   systemctl enable --now srdq-controller srdq-web srdq-executor@huawei srdq-executor@aliyun
+   ssh -J <user>@<jump-host> -L 8470:127.0.0.1:8470 <user>@<ecs>
    ```
 
-   unit 文件里已经做了隔离：
-   - `InaccessiblePaths` 屏蔽不属于本进程的凭证。
-   - `ProtectSystem=strict`、`UMask=0077`。
-   - controller 只允许访问本机网络。
+   然后在本机浏览器打开 http://127.0.0.1:8470。服务部署后已经处于允许运行状态。
 
-7. **访问看板**
+### 离线升级和回滚
 
-   ```bash
-   ssh -L 8470:127.0.0.1:8470 <ecs>
-   ```
+把新版本离线包传到 ECS 并校验、解压，然后执行：
 
-   然后在本机浏览器打开 http://127.0.0.1:8470。
+```bash
+sudo ./srdq-offline-<新版本>/deploy/upgrade.sh
+```
 
-8. **完成初始化后再开启业务检查**
-   - 在 Web 上完成：导入资产清单、发现分区、确认范围、导入并批准规则、建计划或周期，先做一次 PoC 运行。
-   - 确认无误后，把 `run_enabled` 改为 `true`，再重启 controller。
+升级包同样必须通过 `--provision-dir` 构建。升级脚本会停止当前应用服务，先执行一致性 `pg_dump`，保存旧版本配置快照，安装新版本和包内配置，保留已有 worker token，执行增量迁移，原子切换 `current`，再恢复升级前正在运行的服务。备份路径和精确回滚命令会打印到终端。已发布的迁移文件不能修改，数据库变化只能新增连续编号的迁移文件。
+
+若升级后需要回滚，使用升级命令打印的版本和备份路径：
+
+```bash
+sudo /opt/srdq/deploy/rollback.sh <旧版本> /var/lib/srdq/backups/<升级前备份>.dump
+```
+
+回滚会先备份当前数据库，再把数据库和配置恢复到旧版本快照、切回旧代码并进入恢复模式；核对执行器状态后按下节确认恢复。这样升级后产生的数据和新版本配置不会被错误地带到旧结构中。每日 02:30 的备份由 `srdq-pg-backup.timer` 创建，默认保留 14 天；也可以手动执行 `sudo /opt/srdq/bin/srdq-pg-backup --label manual`。
+
+systemd unit 使用 `ProtectSystem=strict`、凭证路径隔离和最小权限。PostgreSQL 在独立的 `srdq-pg` 用户下运行，启用 `PrivateNetwork`，不监听 TCP；只有 `srdq-ctl` 能访问数据库 socket。
 
 ### 从 PG 备份恢复后
 
 ```bash
-srdq recovery enter --reason "restored from backup <id>"
+sudo -u srdq-ctl env SRDQ_CONFIG=/etc/srdq/config.yaml /opt/srdq/current/venv/bin/srdq recovery enter --reason "restored from backup <id>"
 ```
 
 核对执行器状态和未确认的取消，然后执行：
 
 ```bash
-srdq recovery confirm --reason "..."
+sudo -u srdq-ctl env SRDQ_CONFIG=/etc/srdq/config.yaml /opt/srdq/current/venv/bin/srdq recovery confirm --reason "..."
 ```
 
 ## 命令行速查

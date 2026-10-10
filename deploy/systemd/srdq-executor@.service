@@ -8,7 +8,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=SRDQ_CONFIG=/etc/srdq/config.yaml
-ExecStart=/opt/srdq/venv/bin/srdq executor --side %i
+ExecStart=/opt/srdq/current/venv/bin/srdq executor --side %i
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=90

@@ -1,15 +1,16 @@
 [Unit]
 Description=srdq controller (tick loop + executor-facing API on 127.0.0.1:8471)
-After=network-online.target postgresql.service
-Wants=postgresql.service
+Requires=srdq-pg.service
+After=network-online.target srdq-pg.service
 
 [Service]
 Type=simple
 User=srdq-ctl
-Group=srdq-ctl
+Group=srdq
+SupplementaryGroups=srdq-pg
 Environment=SRDQ_CONFIG=/etc/srdq/config.yaml
-ExecStartPre=/opt/srdq/venv/bin/srdq migrate
-ExecStart=/opt/srdq/venv/bin/srdq controller
+ExecStartPre=/opt/srdq/current/venv/bin/srdq migrate
+ExecStart=/opt/srdq/current/venv/bin/srdq controller
 Restart=on-failure
 RestartSec=5
 UMask=0077

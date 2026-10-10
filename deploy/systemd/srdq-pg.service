@@ -1,0 +1,33 @@
+[Unit]
+Description=srdq embedded PostgreSQL (Unix socket only)
+After=local-fs.target
+Before=srdq-controller.service srdq-web.service
+
+[Service]
+Type=simple
+User=srdq-pg
+Group=srdq-pg
+ExecStart=/opt/srdq/postgresql/current/pgserver/pginstall/bin/postgres -D /var/lib/srdq/pg
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=mixed
+RuntimeDirectory=srdq-pg
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ReadWritePaths=/var/lib/srdq/pg
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
