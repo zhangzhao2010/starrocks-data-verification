@@ -9,7 +9,7 @@ from srdq.common import canonical as c
 from srdq.executor import compiler, encoder, probe, tasks
 from srdq.executor.adapter.base import AdapterError
 from srdq.executor.adapter.sim import SimAdapter
-from srdq.executor.adapter.starrocks import parse_show_partitions
+from srdq.executor.adapter.starrocks import normalize_model, parse_show_partitions
 
 SEED = "00000000000000000000000000000000"
 CTX = "11" * 32
@@ -221,6 +221,12 @@ def test_parse_show_partitions():
     assert got["p_min"][1] == "2026-10-01"
     lst = parse_show_partitions([{"PartitionName": "p_bj", "PartitionKey": "city", "List": "(('bj'), ('sh'))"}])
     assert lst["kind"] == "LIST" and lst["partitions"][0]["values"] == ["bj", "sh"]
+
+
+def test_normalize_model_accepts_long_names():
+    assert [normalize_model(m) for m in ("PRIMARY_KEYS", "unique_keys", "AGGREGATE_KEYS", "DUPLICATE_KEYS")] \
+        == ["PRI_KEYS", "UNQ_KEYS", "AGG_KEYS", "DUP_KEYS"]
+    assert [normalize_model(m) for m in ("PRI_KEYS", "UNQ_KEYS", "DUP_KEYS")] == ["PRI_KEYS", "UNQ_KEYS", "DUP_KEYS"]
 
 
 def test_bucket_sql_matches_python_for_extremes(tmp_path):

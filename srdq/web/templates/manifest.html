@@ -24,15 +24,15 @@
   <button type="submit">筛选</button>
 </form>
 {% set s = mf.scopes %}
-<table>
+<div class="scroll"><table>
   <tr><th>表</th><th>类型</th><th>scope_key</th><th>标签</th><th>源端</th><th>目标端</th><th>预期</th><th>状态</th><th>新增</th></tr>
   {% for e in s["items"] %}
   <tr><td><a href="/assets/{{ e.asset_id }}">{{ e.source_db }}.{{ e.source_table }}</a></td><td>{{ e.scope_kind }}</td>
-    <td><code>{{ e.scope_key }}</code></td><td>{{ e.label }}</td><td>{{ e.presence_source }}</td><td>{{ e.presence_target }}</td>
+    <td class="json"><code>{{ e.scope_key }}</code></td><td class="nowrap">{{ e.label }}</td><td>{{ e.presence_source }}</td><td>{{ e.presence_target }}</td>
     <td>{{ m.badge(e.expected_reason) }}</td>
-    <td>{{ m.badge(e.status) }}{% if e.status_reason %} <span class="muted">{{ e.status_reason }}</span>{% endif %}</td>
+    <td class="wrap">{{ m.badge(e.status) }}{% if e.status_reason %} <span class="muted">{{ e.status_reason }}</span>{% endif %}</td>
     <td>{{ "新" if e.is_new else "" }}</td></tr>
   {% else %}<tr><td colspan="9" class="muted">没有范围</td></tr>{% endfor %}
-</table>
+</table></div>
 {{ m.pager(s) }}
 {% endblock %}

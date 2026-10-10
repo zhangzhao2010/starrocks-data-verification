@@ -12,7 +12,7 @@
   <h2>立即运行</h2>
   <form method="post" action="/actions/plans/{{ p.id }}/run" class="stack">
     <input type="hidden" name="request_key" value="{{ new_key }}">
-    <div>{{ m.kinds_picker() }}</div>
+    {{ m.kinds_picker() }}
     <label>rule_key（逗号分隔，可空） <input type="text" name="rule_keys"></label>
     {{ m.reason(required=False) }}
     <button type="submit">创建运行</button>

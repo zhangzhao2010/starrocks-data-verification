@@ -24,7 +24,7 @@
   <div class="card">
     <h2>执行窗口</h2>
     <p class="big">{{ m.badge(d.window.state) }} {{ d.window.key or "" }}</p>
-    <dl>
+    <dl class="kv">
       <dt>开放</dt><dd>{{ ts(d.window.open_at) }}</dd>
       <dt>排空</dt><dd>{{ ts(d.window.drain_at) }}</dd>
       <dt>关闭</dt><dd>{{ ts(d.window.close_at) }}</dd>

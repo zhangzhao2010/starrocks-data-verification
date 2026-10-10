@@ -3,7 +3,7 @@
 {% block content %}
 <section class="card">
   <h2>上传文件（先预览，确认后才生效）</h2>
-  <form method="post" action="/actions/imports/preview" enctype="multipart/form-data">
+  <form method="post" action="/actions/imports/preview" enctype="multipart/form-data" class="stack">
     <label>类型
       <select name="kind">
         <option value="ASSET_LIST">资产名单（7 列 CSV / xlsx）</option>

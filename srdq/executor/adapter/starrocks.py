@@ -12,6 +12,14 @@ from .base import AdapterError, ColumnMeta, TableMeta, classify_error
 
 _RANGE_KEYS_RE = re.compile(r"keys:\s*\[([^\]]*)\]")
 _LIST_VALUE_RE = re.compile(r"'((?:[^'\\]|\\.)*)'|(-?\d+(?:\.\d+)?)")
+# Newer SR versions (e.g. 3.5) report long model names in information_schema.tables_config.
+_MODEL_ALIASES = {"PRIMARY_KEYS": "PRI_KEYS", "UNIQUE_KEYS": "UNQ_KEYS", "AGGREGATE_KEYS": "AGG_KEYS",
+                  "DUPLICATE_KEYS": "DUP_KEYS"}
+
+
+def normalize_model(raw: Any) -> str:
+    model = str(raw).strip().upper()
+    return _MODEL_ALIASES.get(model, model)
 
 
 class CredentialError(RuntimeError):
@@ -183,7 +191,7 @@ class StarRocksAdapter:
                                     [db, table])
             model, keys = None, []
             if cfg:
-                model = str(cfg[0][0]).upper()
+                model = normalize_model(cfg[0][0])
                 keys = [k.strip().strip("`") for k in str(cfg[0][1] or "").split(",") if k.strip()]
             partition = self._partitions(db, table)
         except AdapterError as e:

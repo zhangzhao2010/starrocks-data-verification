@@ -21,12 +21,17 @@
     <label>间隔秒数（≥60） <input type="number" name="interval_seconds" min="60" value="{{ dv.get('interval_seconds', '') }}"></label>
     <label>休息秒数（≥60） <input type="number" name="rest_seconds" min="60" value="{{ dv.get('rest_seconds', '') }}"></label>
     <label>时区 <input type="text" name="timezone" value="{{ dv.get('timezone', default_tz) }}"></label>
-    <label>开始 / 结束（ISO 时间，可空） <input type="text" name="starts_at" value="{{ dv.get('starts_at', '') }}"> <input type="text" name="ends_at" value="{{ dv.get('ends_at', '') }}"></label>
-    <label>重叠 <select name="overlap"><option value="">默认</option><option>SKIP</option><option>COALESCE</option></select>
-      错过 <select name="misfire"><option value="">默认</option><option>SKIP</option><option>LATEST</option></select></label>
-    <label><input type="checkbox" name="cancel_on_end" value="1"> 到结束时间时取消在途运行</label>
+    <div class="row">
+      <label>开始（ISO 时间，可空） <input type="text" name="starts_at" value="{{ dv.get('starts_at', '') }}"></label>
+      <label>结束（ISO 时间，可空） <input type="text" name="ends_at" value="{{ dv.get('ends_at', '') }}"></label>
+    </div>
+    <div class="row">
+      <label>重叠时 <select name="overlap"><option value="">默认</option><option>SKIP</option><option>COALESCE</option></select></label>
+      <label>错过触发时 <select name="misfire"><option value="">默认</option><option>SKIP</option><option>LATEST</option></select></label>
+    </div>
+    <label class="check"><input type="checkbox" name="cancel_on_end" value="1"> 到结束时间时取消在途运行</label>
     <input type="hidden" name="enabled" value="1">
-    <div>{{ m.kinds_picker() }}</div>
+    {{ m.kinds_picker() }}
     {{ m.reason(required=False) }}
     <div><button type="submit" name="preview_only" value="1">预览下次触发时间</button> <button type="submit">创建</button></div>
   </form>

@@ -43,7 +43,7 @@
 {%- endmacro %}
 
 {% macro kinds_picker(selected=None) -%}
-<span class="kinds">检查类型：
+<span class="kinds choices">检查类型：
 {% for k in KINDS %}{% if k != "DEEP" %}<label><input type="checkbox" name="kinds" value="{{ k }}"{% if selected and k in selected %} checked{% endif %}> {{ k }}</label>{% endif %}{% endfor %}
 <span class="muted">（不选＝全部已批准规则）</span></span>
 {%- endmacro %}

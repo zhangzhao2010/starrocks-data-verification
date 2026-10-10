@@ -13,13 +13,15 @@
   <h2>新建计划</h2>
   <form method="post" action="/actions/plans" class="stack">
     <label>名称 <input type="text" name="name" maxlength="128" required></label>
-    <label>范围清单
-      <select name="manifest_mode"><option value="LATEST_CONFIRMED">每次用最新确认的清单</option><option value="FIXED">固定为下面选择的版本</option></select>
-      <select name="manifest_id"><option value="">—</option>{% for x in manifests %}<option value="{{ x.id }}">v{{ x.version }}（{{ x.status }}）</option>{% endfor %}</select>
-    </label>
-    <div>{{ m.kinds_picker() }}</div>
+    <div class="row">
+      <label>范围清单
+        <select name="manifest_mode"><option value="LATEST_CONFIRMED">每次用最新确认的清单</option><option value="FIXED">固定为右侧选择的版本</option></select></label>
+      <label>固定版本（仅“固定”时生效）
+        <select name="manifest_id"><option value="">—</option>{% for x in manifests %}<option value="{{ x.id }}">v{{ x.version }}（{{ x.status }}）</option>{% endfor %}</select></label>
+    </div>
+    {{ m.kinds_picker() }}
     <label>rule_key（逗号分隔，可空） <input type="text" name="rule_keys"></label>
-    <div>层级：{% for l in LAYERS %}<label><input type="checkbox" name="layers" value="{{ l }}"> {{ l }}</label>{% endfor %}<span class="muted">（不选＝全部资产）</span></div>
+    <div class="choices">层级：{% for l in LAYERS %}<label><input type="checkbox" name="layers" value="{{ l }}"> {{ l }}</label>{% endfor %}<span class="muted">（不选＝全部资产）</span></div>
     <label>或指定资产 ID（逗号或换行分隔） <textarea name="asset_ids" rows="2"></textarea></label>
     {{ m.reason(required=False) }}
     <button type="submit">创建</button>
