@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<section class="card">
+  <h2>新建手工复核</h2>
+  <p class="muted">也可以从比较结果页直接发起。scope_keys 每行一个；不填则按来源比较或整表。</p>
+  <form method="post" action="/actions/manual-requests/preview" class="stack">
+    <input type="hidden" name="request_key" value="{{ new_key }}">
+    <label>资产 ID <input type="text" name="asset_id" value="{{ query.asset_id or '' }}"></label>
+    <label>来源比较 ID（可空） <input type="text" name="origin_comparison_id"></label>
+    <label>类型 <select name="check_kind">{% for k in KINDS %}<option>{{ k }}</option>{% endfor %}</select></label>
+    <label>rule_key（可空） <input type="text" name="rule_key"></label>
+    <label>scope_keys <textarea name="scope_keys" rows="3"></textarea></label>
+    <label>DEEP 列（逗号分隔） <input type="text" name="deep_columns"></label>
+    <label>DEEP 方式 <select name="deep_mode"><option>HASH_BUCKET</option><option>KEY_RANGE</option></select>
+      桶数 <input type="number" name="deep_buckets" min="1" class="num">
+      每端最大行数 <input type="number" name="deep_max_rows_per_side" min="1" class="num">
+      最大读取字节 <input type="number" name="deep_max_read_bytes" min="1" class="num"></label>
+    <label>KEY_RANGE 区间（JSON，可空） <input type="text" name="deep_ranges"></label>
+    <label>明细审批依据 <input type="text" name="detail_approval_ref"></label>
+    {{ m.reason() }}
+    <button type="submit">预览</button>
+  </form>
+</section>
+<table>
+  <tr><th>时间</th><th>类型</th><th>证据</th><th>状态</th><th>运行</th><th>原因</th></tr>
+  {% for x in items %}
+  <tr><td><a href="/manual-requests/{{ x.id }}">{{ ts(x.created_at) }}</a></td><td>{{ x.check_kind }}</td><td>{{ x.requested_evidence }}</td>
+    <td>{{ m.badge(x.status) }}</td><td>{% if x.run_id %}<a href="/runs/{{ x.run_id }}">{{ x.run_id[:8] }}</a>{% endif %}</td><td>{{ x.reason or "" }}</td></tr>
+  {% else %}<tr><td colspan="6" class="muted">没有手工复核</td></tr>{% endfor %}
+</table>
+{% endblock %}

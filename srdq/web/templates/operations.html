@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<p class="muted">所有控制都先预览影响范围，再凭预览摘要确认应用；对象在预览后发生变化时需要重新预览。</p>
+<table>
+  <tr><th>时间</th><th>操作</th><th>目标</th><th>范围</th><th>状态</th><th>原因</th><th>应用时间</th></tr>
+  {% for o in items %}
+  <tr><td><a href="/operations/{{ o.id }}">{{ ts(o.created_at) }}</a></td><td>{{ o.op }}</td>
+    <td>{{ o.target_type }}{% if o.target_ids %} × {{ o.target_ids|length }}{% endif %}</td><td>{{ o.effect }}</td>
+    <td>{{ m.badge(o.status) }}</td><td>{{ o.reason or "" }}</td><td>{{ ts(o.applied_at) }}</td></tr>
+  {% else %}<tr><td colspan="7" class="muted">没有操作</td></tr>{% endfor %}
+</table>
+{% endblock %}

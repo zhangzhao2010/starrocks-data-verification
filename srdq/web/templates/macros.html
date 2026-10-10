@@ -1,0 +1,63 @@
+{% macro pager(data, key="page") -%}
+{% set cur = data.page %}
+{% if data.pages > 1 %}
+<div class="pager">
+  共 {{ data.total }} 条，第 {{ cur }} / {{ data.pages }} 页
+  {% set base = qs_without(query, key) %}
+  {% if cur > 1 %}<a href="?{{ base }}{{ '&' if base else '' }}{{ key }}={{ cur - 1 }}">上一页</a>{% endif %}
+  {% if cur < data.pages %}<a href="?{{ base }}{{ '&' if base else '' }}{{ key }}={{ cur + 1 }}">下一页</a>{% endif %}
+</div>
+{% else %}
+<div class="pager">共 {{ data.total }} 条</div>
+{% endif %}
+{%- endmacro %}
+
+{% macro reason(required=True, placeholder="操作原因") -%}
+<label class="reason">原因 <input type="text" name="reason" maxlength="500" placeholder="{{ placeholder }}"{% if required %} required{% endif %}></label>
+{%- endmacro %}
+
+{% macro badge(v) -%}
+{% if v is none %}<span class="badge">—</span>{% else %}<span class="badge b-{{ v|lower }}">{{ v }}</span>{% endif %}
+{%- endmacro %}
+
+{% macro json(v) -%}
+<pre class="json">{{ v|pj }}</pre>
+{%- endmacro %}
+
+{% macro progress_table(progress) -%}
+{% if progress %}
+<table class="compact">
+  <tr><th>类型</th><th>应验</th><th>完成</th><th>完成率</th><th>相同</th><th>相同覆盖率</th><th>差异</th><th>未完成</th><th>待执行</th></tr>
+  {% for p in progress %}
+  <tr>
+    <td>{{ p.check_kind }}</td><td>{{ p.total }}</td><td>{{ p.completed }}</td>
+    <td><progress max="{{ p.total or 1 }}" value="{{ p.completed }}"></progress> {{ p.completed|pct(p.total) }}</td>
+    <td>{{ p.equal }}</td><td>{{ p.equal|pct(p.total) }}</td>
+    <td class="{{ 'warn' if p.different else '' }}">{{ p.different }}</td>
+    <td class="{{ 'warn' if p.incomplete else '' }}">{{ p.incomplete }}</td>
+    <td>{{ p.total - p.done }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">没有检查项</p>{% endif %}
+{%- endmacro %}
+
+{% macro kinds_picker(selected=None) -%}
+<span class="kinds">检查类型：
+{% for k in KINDS %}{% if k != "DEEP" %}<label><input type="checkbox" name="kinds" value="{{ k }}"{% if selected and k in selected %} checked{% endif %}> {{ k }}</label>{% endif %}{% endfor %}
+<span class="muted">（不选＝全部已批准规则）</span></span>
+{%- endmacro %}
+
+{% macro op_form(target_type, target_ids, ops, label="控制", with_kinds=False, with_effect=False) -%}
+<form method="post" action="/actions/operations/preview" class="inline">
+  <input type="hidden" name="target_type" value="{{ target_type }}">
+  {% for t in target_ids %}<input type="hidden" name="target_ids" value="{{ t }}">{% endfor %}
+  <select name="op">{% for o in ops %}<option value="{{ o }}">{{ o }}</option>{% endfor %}</select>
+  {% if "SET_PRIORITY" in ops %}<input type="number" name="priority" min="0" max="100" placeholder="优先级" class="num">{% endif %}
+  {% if with_effect %}
+  <select name="effect"><option value="CURRENT_ONLY">仅本次</option><option value="THIS_AND_FUTURE">本次及以后</option></select>
+  {% endif %}
+  {% if with_kinds %}{{ kinds_picker() }}{% endif %}
+  <button type="submit">{{ label }}预览</button>
+</form>
+{%- endmacro %}

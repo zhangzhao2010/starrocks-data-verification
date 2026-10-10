@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+{% set c = d.control %}
+{% set crit = d.alerts|selectattr("severity", "equalto", "CRITICAL")|list %}
+{% if c.status == "RECOVERY" or crit or d.storage_suspect %}
+<section class="alertbar">
+  {% if c.status == "RECOVERY" %}
+  <div class="alert critical">控制器处于 RECOVERY 状态：所有新领取已停止。核对后在下方“确认恢复”。
+    {% if c.unknown_periods %}未知时间段 {{ c.unknown_periods|length }} 个。{% endif %}</div>
+  {% endif %}
+  {% for a in crit %}
+  <div class="alert critical">[{{ a.kind }}{% if a.side %} · {{ a.side }}{% endif %}] {{ a.message }}
+    <span class="muted">（{{ a.occurrences }} 次，最近 {{ ts(a.last_seen) }}）</span></div>
+  {% endfor %}
+  {% if d.storage_suspect %}
+  <div class="alert critical">疑似存储损坏错误 {{ d.storage_suspect|length }} 项，需要人工排查 SR 存储，
+    <a href="/incidents?kind=STORAGE_SUSPECT&state=OPEN">查看</a></div>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="grid">
+  <div class="card">
+    <h2>执行窗口</h2>
+    <p class="big">{{ m.badge(d.window.state) }} {{ d.window.key or "" }}</p>
+    <dl>
+      <dt>开放</dt><dd>{{ ts(d.window.open_at) }}</dd>
+      <dt>排空</dt><dd>{{ ts(d.window.drain_at) }}</dd>
+      <dt>关闭</dt><dd>{{ ts(d.window.close_at) }}</dd>
+      <dt>控制器</dt><dd>{{ m.badge(c.status) }} 业务检查 {{ "开启" if c.run_enabled else "关闭（run_enabled=false）" }}</dd>
+      <dt>上次日报</dt><dd>{{ c.last_report_window_key or "—" }}</dd>
+    </dl>
+    {% if d.window.state != "CLOSED" %}
+    <form method="post" action="/actions/operations/preview" class="inline">
+      <input type="hidden" name="op" value="CLOSE_WINDOW"><input type="hidden" name="target_type" value="GLOBAL">
+      <button type="submit">提前关闭窗口（预览）</button>
+    </form>
+    <form method="post" action="/actions/operations/preview" class="inline">
+      <input type="hidden" name="op" value="EXTEND_WINDOW"><input type="hidden" name="target_type" value="GLOBAL">
+      <input type="number" name="minutes" min="1" max="1440" value="30" class="num"> 分钟
+      <button type="submit">延长窗口（预览）</button>
+    </form>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>集群负载</h2>
+    <table class="compact">
+      <tr><th>集群</th><th>状态</th><th>并发</th><th>在途</th><th>未确认取消</th><th>触发</th><th>操作</th></tr>
+      {% for side, s in d.clusters.items() %}
+      <tr>
+        <td>{{ side }}</td>
+        <td>{% if s.hard_stop %}<span class="badge b-hard_stop">硬熔断</span>{% elif s.triggers %}<span class="badge b-degraded">降并发</span>{% else %}<span class="badge b-ok">正常</span>{% endif %}</td>
+        <td>{{ s.concurrency if s.concurrency is not none else "默认" }}</td>
+        <td>{{ s.running }}</td>
+        <td class="{{ 'warn' if s.cancel_unconfirmed else '' }}">{{ s.cancel_unconfirmed }}</td>
+        <td>{{ s.triggers|join(", ") or "—" }}</td>
+        <td>{% if s.hard_stop %}
+          <form method="post" action="/actions/operations/preview" class="inline">
+            <input type="hidden" name="op" value="RESUME_CLUSTER"><input type="hidden" name="target_type" value="CLUSTER">
+            <input type="hidden" name="target_ids" value="{{ side }}"><button type="submit">恢复（预览）</button>
+          </form>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>最新结论（按范围的最近一次观察）</h2>
+    <table class="compact">
+      <tr><th>类型</th><th>相同</th><th>差异</th><th>最久未验证</th><th>范围数</th></tr>
+      {% for k in KINDS %}{% set v = d.latest_verdicts.get(k, {}) %}{% set o = d.oldest_verified.get(k) %}
+      {% if v or o %}
+      <tr><td>{{ k }}</td><td>{{ v.get("OBSERVED_EQUAL", 0) }}</td>
+        <td class="{{ 'warn' if v.get('OBSERVED_DIFFERENT') else '' }}"><a href="/differences?kind={{ k }}">{{ v.get("OBSERVED_DIFFERENT", 0) }}</a></td>
+        <td>{% if o %}{{ o.age_hours }} 小时（{{ ts(o.oldest_verified_at) }}）{% else %}—{% endif %}</td>
+        <td>{{ o.scopes if o else 0 }}</td></tr>
+      {% endif %}{% endfor %}
+    </table>
+    <p>无 METRIC 规则的表：<a href="/assets?missing_kind=METRIC">{{ d.rule_gaps.METRIC }}</a> / {{ d.rule_gaps.assets }}；
+       无 SAMPLE 规则的表：<a href="/assets?missing_kind=SAMPLE">{{ d.rule_gaps.SAMPLE }}</a> / {{ d.rule_gaps.assets }}</p>
+    {% if d.purge_deferred %}<p class="warn">原值清理被推迟的材料：{{ d.purge_deferred }}</p>{% endif %}
+  </div>
+</section>
+
+<section>
+  <h2>进行中的运行</h2>
+  {% for r in d.active_runs %}
+  <div class="card">
+    <h3><a href="/runs/{{ r.id }}">{{ r.plan_name or r.purpose }}</a>
+      {{ m.badge(r.execution_state) }} {{ m.badge(r.control_state) }}
+      <span class="muted">开始 {{ ts(r.created_at) }} · 已用窗口 {{ r.windows_used }}{% if r.schedule_name %} · 周期 {{ r.schedule_name }}{% endif %}</span></h3>
+    {{ m.progress_table(r.progress) }}
+  </div>
+  {% else %}
+  <p class="muted">没有进行中的运行。<a href="/plans">去计划页启动</a></p>
+  {% endfor %}
+</section>
+
+<section>
+  <h2>告警（{{ d.alerts|length }}）</h2>
+  {% if d.alerts %}
+  <table>
+    <tr><th>级别</th><th>类型</th><th>集群</th><th>内容</th><th>次数</th><th>最近</th></tr>
+    {% for a in d.alerts %}
+    <tr><td>{{ m.badge(a.severity) }}</td><td>{{ a.kind }}</td><td>{{ a.side or "—" }}</td><td>{{ a.message }}</td>
+      <td>{{ a.occurrences }}</td><td>{{ ts(a.last_seen) }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">没有未关闭的告警</p>{% endif %}
+</section>
+
+<section>
+  <h2>执行器</h2>
+  <table>
+    <tr><th>名称</th><th>逻辑 side</th><th>物理位置</th><th>状态</th><th>最近心跳</th><th>SR 版本</th><th>S1</th></tr>
+    {% for w in d.workers %}
+    <tr><td>{{ w.name }}</td><td>{{ w.side }}</td><td>{{ w.execution_location }}</td>
+      <td>{{ m.badge(w.registration_status or w.status) }}</td><td>{{ ts(w.last_heartbeat_at) }}</td>
+      <td>{{ w.sr_version or "—" }}</td><td>{{ w.s1_status or "—" }}</td></tr>
+    {% else %}<tr><td colspan="7" class="muted">尚未创建执行器凭证（srdq worker-token create）</td></tr>{% endfor %}
+  </table>
+</section>
+
+<section class="card">
+  <h2>恢复</h2>
+  {% if c.status == "RECOVERY" %}
+  {% if c.unknown_periods %}{{ m.json(c.unknown_periods) }}{% endif %}
+  <form method="post" action="/actions/operations/preview" class="inline">
+    <input type="hidden" name="op" value="CONFIRM_RECOVERY"><input type="hidden" name="target_type" value="GLOBAL">
+    <button type="submit">确认恢复（预览）</button>
+  </form>
+  {% else %}
+  <form method="post" action="/actions/recovery" class="inline">
+    {{ m.reason() }}
+    <button type="submit" class="danger">进入 RECOVERY（从备份恢复 PG 后使用）</button>
+  </form>
+  {% endif %}
+</section>
+<p class="muted">每 {{ refresh }} 秒自动刷新 · {{ ts(d.now) }}</p>
+{% endblock %}

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<section class="card">
+  <h2>发现范围</h2>
+  <p class="muted">只读取两端的分区与列元数据（不读业务行），生成 DRAFT 清单；与上一版相比没有新增或消失时自动确认。</p>
+  <form method="post" action="/actions/manifests/discover" class="inline">{{ m.reason(required=False) }} <button type="submit">开始发现</button></form>
+  {% if discoveries %}
+  <table class="compact">
+    <tr><th>发现运行</th><th>状态</th><th>开始</th><th>结束</th></tr>
+    {% for r in discoveries %}<tr><td><a href="/runs/{{ r.id }}">{{ r.id[:8] }}</a></td><td>{{ m.badge(r.execution_state) }}</td><td>{{ ts(r.created_at) }}</td><td>{{ ts(r.completed_at) }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+</section>
+<table>
+  <tr><th>版本</th><th>状态</th><th>元数据完整</th><th>摘要</th><th>创建</th><th>确认</th><th>原因</th></tr>
+  {% for x in items %}
+  <tr><td><a href="/manifests/{{ x.id }}">v{{ x.version }}</a></td><td>{{ m.badge(x.status) }}</td>
+    <td>{{ "是" if x.inventory_complete else "否" }}</td>
+    <td>{% for k, v in (x.summary or {}).items() %}{{ k }}={{ v }} {% endfor %}</td>
+    <td>{{ ts(x.created_at) }}</td><td>{{ ts(x.confirmed_at) }}</td><td>{{ x.reason or "" }}</td></tr>
+  {% else %}<tr><td colspan="7" class="muted">还没有范围清单</td></tr>{% endfor %}
+</table>
+{% endblock %}

@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+{% set CTRL = ["PAUSE", "RESUME", "CANCEL", "ARCHIVE", "RESTORE", "SET_PRIORITY", "CLEAR_PRIORITY"] %}
+<dl class="kv">
+  <dt>用途</dt><dd>{{ r.purpose }}{% if r.plan_name %} · 计划 <a href="/plans/{{ r.plan_id }}">{{ r.plan_name }}</a>{% endif %}{% if r.schedule_name %} · 周期 <a href="/schedules/{{ r.schedule_id }}">{{ r.schedule_name }}</a>{% endif %}</dd>
+  <dt>状态</dt><dd>{{ m.badge(r.execution_state) }} {{ m.badge(r.control_state) }} r{{ r.revision }} · 在途查询 {{ r.live_attempts }}</dd>
+  <dt>开始 / 结束</dt><dd>{{ ts(r.created_at) }} / {{ ts(r.completed_at) }} · 已用窗口 {{ r.windows_used }}</dd>
+  {% if r.manifest_id %}<dt>范围清单</dt><dd><a href="/manifests/{{ r.manifest_id }}">{{ r.manifest_id[:8] }}</a></dd>{% endif %}
+  {% if r.reason %}<dt>原因</dt><dd>{{ r.reason }}</dd>{% endif %}
+</dl>
+{% if r.purpose != "METADATA_PREVIEW" %}
+<div class="actions">
+  {{ m.op_form("RUN", [r.id], CTRL + ["START", "REGENERATE"], label="整轮控制", with_kinds=True) }}
+</div>
+{% endif %}
+
+<h2>进度（按检查类型分开统计）</h2>
+{{ m.progress_table(r.progress) }}
+{% if r.coverage %}
+<details><summary>覆盖状态明细</summary>
+<table class="compact">
+  <tr><th>类型</th>{% for s in coverage_states %}<th>{{ s }}</th>{% endfor %}</tr>
+  {% for k, v in r.coverage.items() %}<tr><td>{{ k }}</td>{% for s in coverage_states %}<td>{% if v.get(s) %}<a href="?check_kind={{ k }}&coverage_state={{ s }}#checks">{{ v.get(s) }}</a>{% else %}0{% endif %}</td>{% endfor %}</tr>{% endfor %}
+</table></details>
+{% endif %}
+{% if r.budgets %}
+<h3>本轮预算</h3>
+<table class="compact">
+  <tr><th>资源</th><th>上限</th><th>预留</th><th>已用</th><th>超出</th><th>状态</th></tr>
+  {% for b in r.budgets %}<tr><td>{{ b.resource }}</td><td>{{ b.limit_amount }}</td><td>{{ b.reserved }}</td><td>{{ b.consumed }}</td><td>{{ b.overrun_amount }}</td><td>{{ m.badge(b.budget_state) }}</td></tr>{% endfor %}
+</table>
+{% endif %}
+
+<h2 id="nodes">范围节点{% if query.asset_id %}（单表：<a href="?">返回全部表</a>）{% endif %}</h2>
+{% if not query.asset_id %}
+<form method="get" class="filters">
+  <select name="layer"><option value="">全部层级</option>{% for l in LAYERS %}<option{% if query.layer == l %} selected{% endif %}>{{ l }}</option>{% endfor %}</select>
+  <input type="search" name="q" value="{{ query.q or '' }}" placeholder="库.表"><button type="submit">筛选</button>
+</form>
+{% endif %}
+<table>
+  <tr><th>表</th><th>节点</th><th>标签</th><th>控制</th><th>优先级</th><th>覆盖</th><th>控制操作</th></tr>
+  {% for n in nodes["items"] %}
+  <tr>
+    <td>{% if query.asset_id %}{{ n.source_db }}.{{ n.source_table }}{% else %}<a href="?asset_id={{ n.asset_id }}#nodes">{{ n.source_db }}.{{ n.source_table }}</a>{% endif %}</td>
+    <td>{{ n.kind }}</td><td>{{ n.label }}</td><td>{{ m.badge(n.control_state) }}</td>
+    <td>{{ n.priority_override if n.priority_override is not none else "—" }}</td>
+    <td class="small">{% for k, v in n.coverage.items() %}<div>{{ k }}：{% for s, c in v.items() %}{{ s }}={{ c }} {% endfor %}</div>{% endfor %}</td>
+    <td>{% if r.purpose != "METADATA_PREVIEW" %}{{ m.op_form("RANGE_NODE", [n.id], CTRL, label="", with_effect=True) }}{% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="7" class="muted">没有节点</td></tr>{% endfor %}
+</table>
+{{ m.pager(nodes, key="npage") }}
+
+<h2 id="checks">检查项</h2>
+<form method="get" class="filters">
+  {% if query.asset_id %}<input type="hidden" name="asset_id" value="{{ query.asset_id }}">{% endif %}
+  <select name="check_kind"><option value="">全部类型</option>{% for k in KINDS %}<option{% if query.check_kind == k %} selected{% endif %}>{{ k }}</option>{% endfor %}</select>
+  <select name="coverage_state"><option value="">全部覆盖状态</option>{% for s in coverage_states %}<option{% if query.coverage_state == s %} selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+  <button type="submit">筛选</button>
+</form>
+<table>
+  <tr><th>表</th><th>类型</th><th>rule_key</th><th>范围</th><th>执行</th><th>覆盖</th><th>原因</th><th>失败次数</th><th>优先级</th><th>结果</th><th>控制</th></tr>
+  {% for c in checks["items"] %}
+  <tr class="{{ 'rowerr' if c.coverage_state in ('ERROR', 'COMPLETED_DIFFERENT') else '' }}">
+    <td>{{ c.source_db }}.{{ c.source_table }}</td><td>{{ c.check_kind }}</td><td>{{ c.rule_key }} r{{ c.rule_revision }}</td>
+    <td>{{ c.scope_label or c.scope_key }}</td><td>{{ m.badge(c.execution_state) }}</td><td>{{ m.badge(c.coverage_state) }}</td>
+    <td class="small">{{ c.coverage_reason or "" }}</td><td>{{ c.attempts_failed }}</td><td>{{ c.effective_priority }}</td>
+    <td>{% if c.current_comparison_id %}<a href="/comparisons/{{ c.current_comparison_id }}">查看</a>{% endif %}</td>
+    <td>{{ m.op_form("RUN_CHECK", [c.id], CTRL + ["REGENERATE"], label="", with_effect=True) }}</td>
+  </tr>
+  {% else %}<tr><td colspan="11" class="muted">没有检查项</td></tr>{% endfor %}
+</table>
+{{ m.pager(checks, key="cpage") }}
+{% endblock %}

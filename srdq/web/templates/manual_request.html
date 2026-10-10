@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+{% set pv = mr.preview or {} %}
+<dl class="kv">
+  <dt>状态</dt><dd>{{ m.badge(mr.status) }}</dd>
+  <dt>类型 / 证据</dt><dd>{{ mr.check_kind }} / {{ mr.requested_evidence }} · {{ mr.source_mode }}</dd>
+  <dt>资产</dt><dd><a href="/assets/{{ mr.asset_id }}">{{ mr.asset_id[:8] }}</a></dd>
+  {% if mr.origin_comparison_id %}<dt>来源比较</dt><dd><a href="/comparisons/{{ mr.origin_comparison_id }}">{{ mr.origin_comparison_id[:8] }}</a></dd>{% endif %}
+  {% if mr.run_id %}<dt>运行</dt><dd><a href="/runs/{{ mr.run_id }}">{{ mr.run_id[:8] }}</a></dd>{% endif %}
+  <dt>明细审批</dt><dd>{{ mr.detail_approval_ref or "—" }}</dd>
+  <dt>原因</dt><dd>{{ mr.reason or "" }}</dd>
+  <dt>时间</dt><dd>{{ ts(mr.created_at) }}{% if mr.confirmed_at %} / 确认 {{ ts(mr.confirmed_at) }}{% endif %}</dd>
+</dl>
+{% for w in pv.warnings or [] %}<div class="alert">{{ w }}</div>{% endfor %}
+{% if pv.scopes %}
+<h2>范围（{{ pv.scopes|length }}）</h2>
+<table class="compact">
+  <tr><th>scope_key</th><th>标签</th></tr>
+  {% for s in pv.scopes %}<tr><td><code>{{ s.scope_key }}</code></td><td>{{ s.label or "" }}</td></tr>{% endfor %}
+</table>
+{% endif %}
+<details{% if mr.status == "PREVIEWED" %} open{% endif %}><summary>完整预览</summary>{{ m.json(pv) }}</details>
+{% if mr.status == "PREVIEWED" %}
+<div class="actions">
+  <form method="post" action="/actions/manual-requests/{{ mr.id }}/confirm" class="inline">
+    <input type="hidden" name="if_match" value="{{ mr.preview_digest }}">
+    {% if mr.check_kind == "DEEP" %}<label>明细审批依据 <input type="text" name="detail_approval_ref" value="{{ mr.detail_approval_ref or '' }}"></label>{% endif %}
+    {{ m.reason() }} <button type="submit">确认并创建运行</button>
+  </form>
+  <form method="post" action="/actions/manual-requests/{{ mr.id }}/reject" class="inline">{{ m.reason() }} <button type="submit" class="danger">放弃</button></form>
+</div>
+{% endif %}
+{% endblock %}

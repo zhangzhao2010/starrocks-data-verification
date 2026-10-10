@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<dl class="kv">
+  <dt>层级</dt><dd>{{ a.layer }}</dd>
+  <dt>源表（huawei）</dt><dd>{{ a.source_db }}.{{ a.source_table }}</dd>
+  <dt>目标表（aliyun）</dt><dd>{{ a.target_db }}.{{ a.target_table }}</dd>
+  <dt>优先级 / 启用</dt><dd>{{ a.priority }} / {{ "是" if a.enabled else "否" }}</dd>
+  <dt>状态 / 版本</dt><dd>{{ m.badge(a.status) }} r{{ a.revision }}</dd>
+  <dt>资产槽</dt><dd>{% if a.slot and a.slot.run_id %}被 <a href="/runs/{{ a.slot.run_id }}">运行</a> 占用（{{ a.slot.state }}，{{ ts(a.slot.acquired_at) }}）{% else %}空闲{% endif %}</dd>
+</dl>
+
+<h2>检查规则</h2>
+<form method="post" action="/actions/rules/approve">
+<input type="hidden" name="back" value="/assets/{{ a.id }}">
+<table>
+  <tr><th></th><th>rule_key</th><th>版本</th><th>类型</th><th>状态</th><th>能力</th><th>启用</th><th>外传级别</th><th>审批依据</th><th>定义</th></tr>
+  {% for r in a.rules %}
+  <tr>
+    <td>{% if r.status == "DRAFT" and r.support_state == "SUPPORTED" %}<input type="checkbox" name="rule_ids" value="{{ r.id }}">{% endif %}</td>
+    <td>{{ r.rule_key }}</td><td>{{ r.revision }}</td><td>{{ r.check_kind }}</td><td>{{ m.badge(r.status) }}</td>
+    <td>{{ m.badge(r.support_state) }}{% if r.support_reason %}<br><span class="muted">{{ r.support_reason }}</span>{% endif %}</td>
+    <td>{{ "是" if r.enabled else "否" }}</td><td>{{ r.transfer_class }}</td><td>{{ r.approval_ref or "—" }}</td>
+    <td><details><summary>查看</summary>{{ m.json(r.definition) }}</details></td>
+  </tr>
+  {% else %}<tr><td colspan="10" class="muted">没有规则</td></tr>{% endfor %}
+</table>
+<p><label>审批依据 <input type="text" name="approval_ref" placeholder="线下审批编号（可用全局默认）"></label>
+  {{ m.reason(required=False) }} <button type="submit">批准勾选的规则</button></p>
+</form>
+
+<h2>当前确认清单中的范围（最多 500 条）</h2>
+<table>
+  <tr><th>类型</th><th>scope_key</th><th>标签</th><th>源端</th><th>目标端</th><th>预期</th><th>状态</th><th>新增</th></tr>
+  {% for e in a.scope_entries %}
+  <tr><td>{{ e.scope_kind }}</td><td><code>{{ e.scope_key }}</code></td><td>{{ e.label }}</td><td>{{ e.presence_source }}</td>
+    <td>{{ e.presence_target }}</td><td>{{ m.badge(e.expected_reason) }}</td>
+    <td>{{ m.badge(e.status) }}{% if e.status_reason %} <span class="muted">{{ e.status_reason }}</span>{% endif %}</td>
+    <td>{{ "新" if e.is_new else "" }}</td></tr>
+  {% else %}<tr><td colspan="8" class="muted">还没有确认的范围清单</td></tr>{% endfor %}
+</table>
+
+<h2>长期控制策略（THIS_AND_FUTURE）</h2>
+<table>
+  <tr><th>scope_key</th><th>节点</th><th>检查范围</th><th>控制</th><th>优先级</th><th>原因</th><th>时间</th></tr>
+  {% for p in a.policies %}
+  <tr><td><code>{{ p.scope_key }}</code></td><td>{{ p.node_kind }}</td><td><code>{{ p.check_selector|pj }}</code></td>
+    <td>{{ p.control_state or "—" }}</td><td>{{ p.priority_override if p.priority_override is not none else "—" }}</td>
+    <td>{{ p.reason or "" }}</td><td>{{ ts(p.created_at) }}</td></tr>
+  {% else %}<tr><td colspan="7" class="muted">没有</td></tr>{% endfor %}
+</table>
+<p><a href="/differences?asset_id={{ a.id }}">该表的差异</a> · <a href="/manual-requests?asset_id={{ a.id }}">发起手工复核</a></p>
+{% endblock %}

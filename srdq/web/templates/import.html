@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<dl class="kv">
+  <dt>类型</dt><dd>{{ b.kind }}</dd><dt>文件</dt><dd>{{ b.file_name }}</dd><dt>模式</dt><dd>{{ b.mode }}</dd>
+  <dt>状态</dt><dd>{{ m.badge(b.status) }}</dd>
+  <dt>摘要</dt><dd>{% for k, v in (b.summary or {}).items() %}{{ k }}={{ v }} {% endfor %}</dd>
+  <dt>上传时间</dt><dd>{{ ts(b.created_at) }}</dd>
+  {% if b.confirmed_at %}<dt>确认时间</dt><dd>{{ ts(b.confirmed_at) }}</dd>{% endif %}
+  {% if b.reason %}<dt>原因</dt><dd>{{ b.reason }}</dd>{% endif %}
+</dl>
+{% if b.status == "PREVIEWED" %}
+<div class="actions">
+  <form method="post" action="/actions/imports/{{ b.id }}/confirm" class="inline">
+    {{ m.reason(required=False) }} <button type="submit">确认导入（ERROR 行不生效）</button></form>
+  <form method="post" action="/actions/imports/{{ b.id }}/reject" class="inline">
+    {{ m.reason(required=False) }} <button type="submit" class="danger">放弃</button></form>
+</div>
+{% elif b.status == "CONFIRMED" and b.kind != "ASSET_LIST" %}
+<p><a href="/rules?status=DRAFT">去批准导入的 DRAFT 规则</a></p>
+{% endif %}
+<table>
+  <tr><th>行</th><th>结果</th><th>内容</th><th>错误 / 变更</th></tr>
+  {% for r in b.rows %}
+  <tr class="{{ 'rowerr' if r.status == 'ERROR' else '' }}">
+    <td>{{ r.line if r.line is defined else (r.get("lines") or [])|join(", ") }}</td><td>{{ m.badge(r.status) }}</td>
+    <td>{% if r.rule_key is defined %}{{ r.source_db }}.{{ r.source_table }} · <code>{{ r.rule_key }}</code>
+        {% if r.definition %}<details><summary>规则定义</summary>{{ m.json(r.definition) }}</details>{% endif %}
+      {% else %}<code>{{ r.get("values", r.get("raw"))|pj }}</code>{% endif %}</td>
+    <td>{% for e in r.errors or [] %}<div class="err">{{ e }}</div>{% endfor %}
+      {% for u in r.unsupported or [] %}<div class="warn">UNSUPPORTED：{{ u }}</div>{% endfor %}
+      {% for w in r.warnings or [] %}<div class="warn">{{ w }}</div>{% endfor %}
+      {% if r.changes %}<code>{{ r.changes|pj }}</code>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

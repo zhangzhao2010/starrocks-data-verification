@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<dl class="kv">
+  <dt>表</dt><dd><a href="/assets/{{ c.asset_id }}">{{ c.source_db }}.{{ c.source_table }}</a> ↔ {{ c.target_db }}.{{ c.target_table }}（{{ c.layer }}）</dd>
+  <dt>范围</dt><dd>{{ c.scope_label or c.scope_key }} <code>{{ c.scope_key }}</code></dd>
+  <dt>规则</dt><dd>{{ c.check_kind }} · {{ c.rule_key }} r{{ c.rule_revision }} · 证据 {{ c.evidence }}</dd>
+  <dt>结论</dt><dd>{{ m.badge(c.verdict) }} 差异 {{ c.difference_count }}（{{ c.difference_count_mode }}）{% if c.reason %} · {{ c.reason }}{% endif %}</dd>
+  <dt>比较时间</dt><dd>{{ ts(c.compared_at) }} · <a href="/runs/{{ c.run_id }}">所属运行</a></dd>
+  <dt>共同快照</dt><dd>{{ c.statement.common_snapshot }} · {{ c.statement.read_mode }} · {{ c.statement.note }}</dd>
+</dl>
+{% if c.summary %}<h2>摘要</h2>{{ m.json(c.summary) }}{% endif %}
+
+<h2>两端结果</h2>
+<table>
+  <tr><th>集群</th><th>证据</th><th>行数</th><th>字节</th><th>有效性</th><th>读取开始</th><th>读取结束</th><th>query_ref</th><th>原值</th></tr>
+  {% for s in c.side_results %}
+  <tr><td>{{ s.side }}</td><td>{{ s.evidence }}</td><td>{{ s.row_count if s.row_count is not none else "—" }}</td><td>{{ s.total_bytes or "—" }}</td>
+    <td>{{ m.badge(s.validity) }}</td><td>{{ ts(s.read_started) }}</td><td>{{ ts(s.read_finished) }}</td><td><code>{{ s.query_ref|pj if s.query_ref else "" }}</code></td>
+    <td>{{ "已清理 " ~ ts(s.raw_purged_at) if s.raw_purged_at else "保留中" }}</td></tr>
+  {% endfor %}
+</table>
+
+<h2>差异明细</h2>
+{% if diffs.masked %}<p class="muted">原值默认脱敏。<a href="?{{ qs_without(query, 'show_values') }}{{ '&' if qs_without(query, 'show_values') else '' }}show_values=1">显示原值</a>（查看会记入浏览器历史，请注意外传规定）</p>
+{% elif query.show_values %}<p><a href="?{{ qs_without(query, 'show_values') }}">重新脱敏</a></p>{% endif %}
+<table>
+  <tr><th>#</th><th>类型</th><th>分组 / 键</th><th>指标 / 列</th><th>源端值</th><th>目标端值</th><th>详情</th></tr>
+  {% for x in diffs["items"] %}
+  <tr><td>{{ x.ordinal }}</td><td>{{ x.type }}</td>
+    <td>{% if x.group_values not in (none, "", [], {}) %}<code>{{ x.group_values if x.masked else x.group_values|pj }}</code>{% endif %}
+        {% if x.key_values not in (none, "", [], {}) %}<code>{{ x.key_values if x.masked else x.key_values|pj }}</code>{% elif x.key_hex %}<code>{{ x.key_hex }}</code>{% endif %}</td>
+    <td>{{ x.metric_id or x.column_name or "" }}</td>
+    <td>{{ x.source_value if x.source_value is not none else "" }}</td><td>{{ x.target_value if x.target_value is not none else "" }}</td>
+    <td>{% if x.detail %}<code>{{ x.detail|pj }}</code>{% endif %}</td></tr>
+  {% else %}<tr><td colspan="7" class="muted">没有差异明细</td></tr>{% endfor %}
+</table>
+{{ m.pager(diffs) }}
+
+<section class="card">
+  <h2>发起手工复核</h2>
+  <p class="muted">重新在线读取两端（LIVE_REREAD）。DEEP 局部诊断需要列、分片方式和明细外传审批。</p>
+  <form method="post" action="/actions/manual-requests/preview" class="stack">
+    <input type="hidden" name="request_key" value="{{ new_key }}">
+    <input type="hidden" name="origin_comparison_id" value="{{ c.id }}">
+    <label>类型 <select name="check_kind">{% for k in KINDS %}<option{% if k == c.check_kind %} selected{% endif %}>{{ k }}</option>{% endfor %}</select></label>
+    <label>DEEP 列（逗号分隔） <input type="text" name="deep_columns"></label>
+    <label>DEEP 方式 <select name="deep_mode"><option>HASH_BUCKET</option><option>KEY_RANGE</option></select>
+      桶数 <input type="number" name="deep_buckets" min="1" class="num"></label>
+    <label>KEY_RANGE 区间（JSON，可空） <input type="text" name="deep_ranges"></label>
+    <label>明细审批依据 <input type="text" name="detail_approval_ref"></label>
+    {{ m.reason() }}
+    <button type="submit">预览复核</button>
+  </form>
+</section>
+
+<h2>同一范围的历史</h2>
+<table class="compact">
+  <tr><th>时间</th><th>结论</th><th>差异数</th></tr>
+  {% for h in c.history %}<tr><td><a href="/comparisons/{{ h.id }}">{{ ts(h.compared_at) }}</a>{% if h.id == c.id %}（本次）{% endif %}</td><td>{{ m.badge(h.verdict) }}</td><td>{{ h.difference_count }}</td></tr>{% endfor %}
+</table>
+{% endblock %}

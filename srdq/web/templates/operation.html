@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+{% set pv = o.preview or {} %}
+<dl class="kv">
+  <dt>操作</dt><dd>{{ o.op }} · {{ o.target_type }} · {{ o.effect }}</dd>
+  <dt>状态</dt><dd>{{ m.badge(o.status) }}</dd>
+  <dt>检查范围</dt><dd><code>{{ o.check_selector|pj }}</code></dd>
+  {% if o.params %}<dt>参数</dt><dd><code>{{ o.params|pj }}</code></dd>{% endif %}
+  <dt>预览时间</dt><dd>{{ ts(o.created_at) }}</dd>
+  {% if o.applied_at %}<dt>应用时间</dt><dd>{{ ts(o.applied_at) }}（{{ o.reason }}）</dd>{% endif %}
+</dl>
+{% for w in pv.warnings or [] %}<div class="alert">{{ w }}</div>{% endfor %}
+
+<h2>影响范围</h2>
+{% if pv.targets %}
+<table class="compact">
+  <tr><th>目标</th><th>控制</th><th>执行</th><th>说明</th></tr>
+  {% for t in pv.targets %}
+  <tr><td>{% if o.target_type == "RUN" %}<a href="/runs/{{ t.id }}">{{ t.id[:8] }}</a>{% else %}<code>{{ t.id[:8] }}</code>{% endif %}</td>
+    <td>{{ m.badge(t.control_state) }}</td><td>{{ t.execution_state or "" }}</td><td>{{ t.kind or "" }} {{ t.label or "" }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if pv.run_checks %}<p>涉及检查项 {{ pv.run_checks.total }}：{% for k, v in pv.run_checks.by_execution_state.items() %}{{ k }}={{ v }} {% endfor %}</p>{% endif %}
+{% if pv.changes %}<p>将改变 {{ pv.changes.count }} 个对象的状态{% if pv.changes.count > pv.changes["items"]|length %}（下表只列前 {{ pv.changes["items"]|length }} 个）{% endif %}。</p>
+<table class="compact">
+  <tr><th>对象</th><th>字段</th><th>从</th><th>到</th></tr>
+  {% for c in pv.changes["items"] %}<tr><td>{{ c.object_type }} <code>{{ c.id[:8] }}</code></td><td>{{ c.field }}</td><td>{{ c["from"] if c["from"] is not none else "—" }}</td><td>{{ c["to"] if c["to"] is not none else "—" }}</td></tr>{% endfor %}
+</table>
+{% endif %}
+{% if pv.in_flight %}{% set f = pv.in_flight %}<p>在途：已开始的观察 {{ f.started_observations }}，未开始 {{ f.unstarted_observations }}；
+  运行中查询 {% for s, n in f.live_attempts.items() %}{{ s }}={{ n }} {% endfor %}；排空剩余单元 {{ f.drain_remaining_units }}</p>{% endif %}
+{% if pv.future_policy %}<h3>长期策略（以后的运行）</h3>{{ m.json(pv.future_policy) }}{% endif %}
+{% if pv.regenerate %}<h3>重新生成</h3>{{ m.json(pv.regenerate) }}{% endif %}
+{% if pv.window %}<h3>执行窗口</h3>{{ m.json(pv.window) }}{% endif %}
+{% if pv.cluster %}<h3>集群</h3>{{ m.json(pv.cluster) }}{% endif %}
+{% if pv.unknown_periods %}<h3>未知时间段</h3>{{ m.json(pv.unknown_periods) }}{% endif %}
+<details><summary>完整预览</summary>{{ m.json(pv) }}</details>
+
+{% if o.status == "PREVIEWED" %}
+<section class="card">
+  <h2>确认应用</h2>
+  <form method="post" action="/actions/operations/{{ o.id }}/apply" class="inline">
+    <input type="hidden" name="idempotency_key" value="{{ idem }}">
+    <input type="hidden" name="if_match" value="{{ o.preview_digest }}">
+    {{ m.reason() }}
+    <button type="submit" class="{{ 'danger' if o.op in ('CANCEL', 'ARCHIVE', 'CLOSE_WINDOW') else '' }}">应用 {{ o.op }}</button>
+  </form>
+  <p class="muted">预览摘要 <code>{{ o.preview_digest[:16] }}</code></p>
+</section>
+{% elif o.status == "STALE" %}
+<div class="alert">对象在预览后发生了变化，请回到原页面重新预览。</div>
+{% endif %}
+{% if o.result %}<h2>结果</h2>{{ m.json(o.result) }}{% endif %}
+{% endblock %}

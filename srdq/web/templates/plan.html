@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<dl class="kv">
+  <dt>状态 / 版本</dt><dd>{{ m.badge(p.status) }} r{{ p.revision }}</dd>
+  <dt>范围清单</dt><dd>{{ p.manifest_mode }}{% if p.manifest_id %} · <a href="/manifests/{{ p.manifest_id }}">固定版本</a>{% endif %}</dd>
+  <dt>检查范围</dt><dd><code>{{ p.check_selector|pj }}</code></dd>
+  <dt>资产范围</dt><dd><code>{{ p.asset_selector|pj }}</code></dd>
+</dl>
+{% if p.status == "ACTIVE" %}
+<section class="card">
+  <h2>立即运行</h2>
+  <form method="post" action="/actions/plans/{{ p.id }}/run" class="stack">
+    <input type="hidden" name="request_key" value="{{ new_key }}">
+    <div>{{ m.kinds_picker() }}</div>
+    <label>rule_key（逗号分隔，可空） <input type="text" name="rule_keys"></label>
+    {{ m.reason(required=False) }}
+    <button type="submit">创建运行</button>
+  </form>
+  <p class="muted">运行冻结当时的规则版本和应验范围；执行只发生在执行窗口内。</p>
+</section>
+<section class="card">
+  <h2>归档计划</h2>
+  <form method="post" action="/actions/plans/{{ p.id }}/archive" class="inline">
+    <input type="hidden" name="revision" value="{{ p.revision }}">{{ m.reason() }} <button type="submit" class="danger">归档</button>
+  </form>
+</section>
+{% endif %}
+<h2>周期</h2>
+<table>
+  <tr><th>名称</th><th>类型</th><th>状态</th><th>启用</th><th>下次</th></tr>
+  {% for s in p.schedules %}<tr><td><a href="/schedules/{{ s.id }}">{{ s.name }}</a></td><td>{{ s.kind }}</td><td>{{ m.badge(s.status) }}</td><td>{{ "是" if s.enabled else "否" }}</td><td>{{ ts(s.next_due_at) }}</td></tr>
+  {% else %}<tr><td colspan="5" class="muted">没有周期。<a href="/schedules">新建</a></td></tr>{% endfor %}
+</table>
+<h2>最近运行</h2>
+<table>
+  <tr><th>开始</th><th>执行</th><th>控制</th><th>窗口数</th><th>结束</th></tr>
+  {% for r in p.runs %}<tr><td><a href="/runs/{{ r.id }}">{{ ts(r.created_at) }}</a></td><td>{{ m.badge(r.execution_state) }}</td><td>{{ m.badge(r.control_state) }}</td><td>{{ r.windows_used }}</td><td>{{ ts(r.completed_at) }}</td></tr>
+  {% else %}<tr><td colspan="5" class="muted">没有</td></tr>{% endfor %}
+</table>
+{% endblock %}

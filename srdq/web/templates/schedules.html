@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<table>
+  <tr><th>名称</th><th>计划</th><th>类型</th><th>表达式</th><th>状态</th><th>下次</th><th>等待原因</th></tr>
+  {% for s in items %}
+  <tr><td><a href="/schedules/{{ s.id }}">{{ s.name }}</a></td><td><a href="/plans/{{ s.plan_id }}">{{ plan_names.get(s.plan_id, s.plan_id[:8]) }}</a></td>
+    <td>{{ s.kind }}</td>
+    <td>{% if s.kind == "CRON" %}<code>{{ s.cron_expr }}</code>{% elif s.kind == "INTERVAL" %}每 {{ s.interval_seconds }} 秒{% else %}完成后休息 {{ s.rest_seconds }} 秒{% endif %} · {{ s.timezone }}</td>
+    <td>{{ m.badge(s.status) }} {{ "" if s.enabled else "（停用）" }}</td><td>{{ ts(s.next_due_at) }}</td><td>{{ s.waiting_reason or "" }}</td></tr>
+  {% else %}<tr><td colspan="7" class="muted">还没有周期</td></tr>{% endfor %}
+</table>
+<section class="card">
+  <h2>新建周期</h2>
+  {% set dv = draft or {} %}
+  <form method="post" action="/actions/schedules" class="stack">
+    <label>名称 <input type="text" name="name" maxlength="128" required value="{{ dv.get('name', '') }}"></label>
+    <label>计划 <select name="plan_id" required>{% for p in plans %}<option value="{{ p.id }}"{% if dv.get('plan_id') == p.id %} selected{% endif %}>{{ p.name }}</option>{% endfor %}</select></label>
+    <label>类型 <select name="kind">{% for k, t in [("CRON", "CRON 表达式"), ("INTERVAL", "固定间隔"), ("CONTINUOUS", "连续（完成后休息再开始）")] %}<option value="{{ k }}"{% if dv.get('kind') == k %} selected{% endif %}>{{ t }}</option>{% endfor %}</select></label>
+    <label>CRON（5 段） <input type="text" name="cron_expr" placeholder="0 1 * * *" value="{{ dv.get('cron_expr', '') }}"></label>
+    <label>间隔秒数（≥60） <input type="number" name="interval_seconds" min="60" value="{{ dv.get('interval_seconds', '') }}"></label>
+    <label>休息秒数（≥60） <input type="number" name="rest_seconds" min="60" value="{{ dv.get('rest_seconds', '') }}"></label>
+    <label>时区 <input type="text" name="timezone" value="{{ dv.get('timezone', default_tz) }}"></label>
+    <label>开始 / 结束（ISO 时间，可空） <input type="text" name="starts_at" value="{{ dv.get('starts_at', '') }}"> <input type="text" name="ends_at" value="{{ dv.get('ends_at', '') }}"></label>
+    <label>重叠 <select name="overlap"><option value="">默认</option><option>SKIP</option><option>COALESCE</option></select>
+      错过 <select name="misfire"><option value="">默认</option><option>SKIP</option><option>LATEST</option></select></label>
+    <label><input type="checkbox" name="cancel_on_end" value="1"> 到结束时间时取消在途运行</label>
+    <input type="hidden" name="enabled" value="1">
+    <div>{{ m.kinds_picker() }}</div>
+    {{ m.reason(required=False) }}
+    <div><button type="submit" name="preview_only" value="1">预览下次触发时间</button> <button type="submit">创建</button></div>
+  </form>
+  {% if preview %}
+  <h3>预览：{{ preview.kind }} · {{ preview.timezone }}</h3>
+  <ol>{% for t in preview.next_fires %}<li>{{ ts(t) }}</li>{% else %}<li class="muted">没有可预见的触发（CONTINUOUS 在上一轮完成后才排下一次）</li>{% endfor %}</ol>
+  {% endif %}
+</section>
+{% endblock %}

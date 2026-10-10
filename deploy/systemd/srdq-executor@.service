@@ -1,0 +1,25 @@
+# Template unit: srdq-executor@huawei.service runs as srdq-hw, srdq-executor@aliyun.service as srdq-al.
+# The per-side user is set by the drop-ins in srdq-executor@huawei.service.d/ and srdq-executor@aliyun.service.d/.
+[Unit]
+Description=srdq %i executor (read-only StarRocks queries for side %i)
+After=network-online.target srdq-controller.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SRDQ_CONFIG=/etc/srdq/config.yaml
+ExecStart=/opt/srdq/venv/bin/srdq executor --side %i
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/srdq/executor/%i
+InaccessiblePaths=-/etc/srdq/secrets/pg.json
+
+[Install]
+WantedBy=multi-user.target

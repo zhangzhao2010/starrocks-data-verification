@@ -1,0 +1,27 @@
+[Unit]
+Description=srdq controller (tick loop + executor-facing API on 127.0.0.1:8471)
+After=network-online.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=srdq-ctl
+Group=srdq-ctl
+Environment=SRDQ_CONFIG=/etc/srdq/config.yaml
+ExecStartPre=/opt/srdq/venv/bin/srdq migrate
+ExecStart=/opt/srdq/venv/bin/srdq controller
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/srdq/controller /var/lib/srdq/reports
+InaccessiblePaths=-/etc/srdq/secrets/huawei.json -/etc/srdq/secrets/aliyun.json
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

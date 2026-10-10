@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<p class="muted">日报在窗口关闭、取消全部确认（或超过宽限时间）后自动生成；不向外发送任何消息。需要 PDF 时请在本机用 pandoc 等工具转换 report.md。</p>
+<section class="card">
+  <h2>生成阶段报告</h2>
+  <form method="post" action="/actions/reports/stage" class="stack">
+    <label>开始日期 <input type="date" name="start_date" required></label>
+    <label>结束日期 <input type="date" name="end_date" required></label>
+    {{ m.reason(required=False, placeholder="用途，例如阶段验收") }}
+    <button type="submit">生成</button>
+  </form>
+</section>
+<table>
+  <tr><th>生成时间</th><th>类型</th><th>窗口</th><th>统计区间</th><th>文件</th><th>大小</th><th></th></tr>
+  {% for r in items %}
+  <tr>
+    <td>{{ ts(r.created_at) }}</td><td>{{ m.badge(r.kind) }}</td><td>{{ r.window_key or "" }}</td>
+    <td class="small">{{ ts(r.interval_start) }} — {{ ts(r.interval_end) }}</td>
+    <td>{% for f in r.files %}<a href="/v1/reports/{{ r.id }}/files/{{ f }}">{{ f }}</a>{% if not loop.last %} · {% endif %}{% endfor %}</td>
+    <td class="num">{{ r.size_bytes }}</td>
+    <td>{% if r.kind == "DAILY" and r.window_key %}
+      <form method="post" action="/actions/reports/daily/{{ r.window_key }}/regenerate" class="inline">
+        {{ m.reason(required=False, placeholder="重新生成原因") }}<button type="submit">重新生成</button>
+      </form>{% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="7" class="muted">还没有报告</td></tr>{% endfor %}
+</table>
+{% endblock %}

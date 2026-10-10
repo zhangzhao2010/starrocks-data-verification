@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<dl class="kv">
+  <dt>状态</dt><dd>{{ m.badge(mf.status) }}</dd>
+  <dt>元数据完整</dt><dd>{{ "是" if mf.inventory_complete else "否（有表的元数据没有取到，不能自动确认）" }}</dd>
+  <dt>摘要</dt><dd>{% for k, v in (mf.summary or {}).items() %}{{ k }}={{ v }} {% endfor %}</dd>
+  <dt>基于</dt><dd>{% if mf.based_on_id %}<a href="/manifests/{{ mf.based_on_id }}">上一版</a>{% else %}—{% endif %}</dd>
+  <dt>发现运行</dt><dd>{% if mf.discovery_run_id %}<a href="/runs/{{ mf.discovery_run_id }}">{{ mf.discovery_run_id[:8] }}</a>{% else %}—{% endif %}</dd>
+  <dt>创建 / 确认</dt><dd>{{ ts(mf.created_at) }} / {{ ts(mf.confirmed_at) }}</dd>
+  {% if mf.reason %}<dt>原因</dt><dd>{{ mf.reason }}</dd>{% endif %}
+</dl>
+{% if mf.status == "DRAFT" %}
+<div class="actions">
+  <form method="post" action="/actions/manifests/{{ mf.id }}/confirm" class="inline">{{ m.reason(required=False) }} <button type="submit">确认清单</button></form>
+  <form method="post" action="/actions/manifests/{{ mf.id }}/reject" class="inline">{{ m.reason(required=False) }} <button type="submit" class="danger">驳回</button></form>
+</div>
+{% endif %}
+<h2>范围</h2>
+<form method="get" class="filters">
+  <select name="expected_reason"><option value="">全部预期</option>{% for s in ["IN_SCOPE", "SOURCE_ONLY", "TARGET_ONLY", "UNKNOWN", "ACCESS_DENIED"] %}<option{% if query.expected_reason == s %} selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+  <label><input type="checkbox" name="new_only" value="1"{% if query.new_only == "1" %} checked{% endif %}> 只看新增</label>
+  <input type="search" name="q" value="{{ query.q or '' }}" placeholder="库.表 或 分区">
+  <button type="submit">筛选</button>
+</form>
+{% set s = mf.scopes %}
+<table>
+  <tr><th>表</th><th>类型</th><th>scope_key</th><th>标签</th><th>源端</th><th>目标端</th><th>预期</th><th>状态</th><th>新增</th></tr>
+  {% for e in s["items"] %}
+  <tr><td><a href="/assets/{{ e.asset_id }}">{{ e.source_db }}.{{ e.source_table }}</a></td><td>{{ e.scope_kind }}</td>
+    <td><code>{{ e.scope_key }}</code></td><td>{{ e.label }}</td><td>{{ e.presence_source }}</td><td>{{ e.presence_target }}</td>
+    <td>{{ m.badge(e.expected_reason) }}</td>
+    <td>{{ m.badge(e.status) }}{% if e.status_reason %} <span class="muted">{{ e.status_reason }}</span>{% endif %}</td>
+    <td>{{ "新" if e.is_new else "" }}</td></tr>
+  {% else %}<tr><td colspan="9" class="muted">没有范围</td></tr>{% endfor %}
+</table>
+{{ m.pager(s) }}
+{% endblock %}

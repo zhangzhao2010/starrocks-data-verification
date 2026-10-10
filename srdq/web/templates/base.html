@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
+<title>{{ title }} · SRDQ 双云数据校验</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/">SRDQ 双云数据校验</a>
+  <nav>
+    {% set nav = [("/", "看板"), ("/differences", "差异"), ("/runs", "运行"), ("/plans", "计划"), ("/schedules", "周期"),
+                  ("/assets", "资产"), ("/rules", "规则"), ("/manifests", "范围清单"), ("/imports", "导入"),
+                  ("/manual-requests", "手工复核"), ("/operations", "操作"), ("/reports", "报告"),
+                  ("/incidents", "告警"), ("/workers", "执行器"), ("/audit", "审计")] %}
+    {% for href, label in nav %}
+      <a href="{{ href }}"{% if path == href or (href != "/" and path.startswith(href)) %} class="on"{% endif %}>{{ label }}</a>
+    {% endfor %}
+  </nav>
+</header>
+<main>
+<h1>{{ title }}</h1>
+{% block content %}{% endblock %}
+</main>
+<footer>时间按 {{ tzname }} 显示 · 两端为在线读取，没有共同快照</footer>
+</body>
+</html>

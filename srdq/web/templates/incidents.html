@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<form method="get" class="filters">
+  <label>状态 <select name="state"><option value="">全部</option>
+    {% for s in ["OPEN", "CLOSED"] %}<option value="{{ s }}"{% if query.get("state") == s %} selected{% endif %}>{{ s }}</option>{% endfor %}
+  </select></label>
+  <label>类型 <input type="text" name="kind" value="{{ query.get('kind', '') }}" placeholder="例如 STORAGE_SUSPECT"></label>
+  <label>集群 <select name="side"><option value="">全部</option>
+    {% for s in SIDES %}<option value="{{ s }}"{% if query.get("side") == s %} selected{% endif %}>{{ s }}</option>{% endfor %}
+  </select></label>
+  <button type="submit">筛选</button>
+</form>
+<table>
+  <tr><th>最近</th><th>首次</th><th>级别</th><th>类型</th><th>集群</th><th>状态</th><th>次数</th><th>内容</th><th>关联</th></tr>
+  {% for i in data["items"] %}
+  <tr class="{{ 'rowerr' if i.severity == 'CRITICAL' and i.state == 'OPEN' else '' }}">
+    <td>{{ ts(i.last_seen) }}</td><td>{{ ts(i.first_seen) }}</td><td>{{ m.badge(i.severity) }}</td>
+    <td>{{ i.kind }}</td><td>{{ i.side or "" }}</td><td>{{ m.badge(i.state) }}</td><td class="num">{{ i.occurrences }}</td>
+    <td>{{ i.message }}{% if i.error_code %} <span class="muted">[{{ i.error_code }}]</span>{% endif %}
+      {% if i.detail %}<details><summary>详情</summary>{{ m.json(i.detail) }}</details>{% endif %}</td>
+    <td class="small">
+      {% if i.run_id %}<a href="/runs/{{ i.run_id }}">运行</a>{% endif %}
+      {% if i.asset_id %}<a href="/assets/{{ i.asset_id }}">资产</a>{% endif %}
+      {{ i.check_kind or "" }} {{ i.rule_key or "" }} {{ i.scope_key or "" }}
+    </td>
+  </tr>
+  {% else %}<tr><td colspan="9" class="muted">没有记录</td></tr>{% endfor %}
+</table>
+{{ m.pager(data) }}
+{% endblock %}

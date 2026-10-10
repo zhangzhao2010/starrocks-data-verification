@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<section class="card alert critical">
+  <p><strong>{{ error.code }}</strong>：{{ error.message }}</p>
+  {% if error.detail %}{{ m.json(error.detail) }}{% endif %}
+</section>
+<p class="muted">请用浏览器的后退返回上一页（表单内容会保留）· <a href="/">回到看板</a></p>
+{% endblock %}

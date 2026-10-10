@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<section class="card">
+  <h2>上传文件（先预览，确认后才生效）</h2>
+  <form method="post" action="/actions/imports/preview" enctype="multipart/form-data">
+    <label>类型
+      <select name="kind">
+        <option value="ASSET_LIST">资产名单（7 列 CSV / xlsx）</option>
+        <option value="METRIC_TEMPLATE">METRIC 规则模板</option>
+        <option value="SAMPLE_TEMPLATE">SAMPLE 规则模板</option>
+      </select></label>
+    <label>资产名单模式
+      <select name="mode">
+        <option value="CREATE_OR_VALIDATE">新增或校验（已有资产不改）</option>
+        <option value="UPDATE_EXPLICIT">显式更新已有资产</option>
+      </select></label>
+    <input type="file" name="file" required>
+    <button type="submit">上传并预览</button>
+  </form>
+  <p class="muted">资产名单列：layer,source_db,source_table,target_db,target_table,priority,enabled。规则模板导入后为 DRAFT，需要在“规则”页批准。</p>
+</section>
+<table>
+  <tr><th>时间</th><th>类型</th><th>文件</th><th>模式</th><th>状态</th><th>摘要</th><th>原因</th></tr>
+  {% for b in items %}
+  <tr><td><a href="/imports/{{ b.id }}">{{ ts(b.created_at) }}</a></td><td>{{ b.kind }}</td><td>{{ b.file_name }}</td>
+    <td>{{ b.mode }}</td><td>{{ m.badge(b.status) }}</td>
+    <td>{% for k, v in (b.summary or {}).items() %}{{ k }}={{ v }} {% endfor %}</td><td>{{ b.reason or "" }}</td></tr>
+  {% else %}<tr><td colspan="7" class="muted">还没有导入</td></tr>{% endfor %}
+</table>
+{% endblock %}

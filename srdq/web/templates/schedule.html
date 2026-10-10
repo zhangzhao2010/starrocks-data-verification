@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<dl class="kv">
+  <dt>计划</dt><dd><a href="/plans/{{ s.plan_id }}">{{ s.plan_id[:8] }}</a></dd>
+  <dt>类型</dt><dd>{{ s.kind }} {% if s.cron_expr %}<code>{{ s.cron_expr }}</code>{% endif %}{% if s.interval_seconds %} 每 {{ s.interval_seconds }} 秒{% endif %}{% if s.rest_seconds %} 休息 {{ s.rest_seconds }} 秒{% endif %} · {{ s.timezone }}</dd>
+  <dt>状态 / 版本</dt><dd>{{ m.badge(s.status) }} {{ "启用" if s.enabled else "停用" }} r{{ s.revision }}</dd>
+  <dt>起止</dt><dd>{{ ts(s.starts_at) }} ～ {{ ts(s.ends_at) }}{% if s.cancel_on_end %}（结束时取消在途运行）{% endif %}</dd>
+  <dt>重叠 / 错过</dt><dd>{{ s.overlap }} / {{ s.misfire }}{% if s.coalesced %}（已合并 {{ s.coalesced }} 次）{% endif %}</dd>
+  <dt>检查范围</dt><dd><code>{{ s.check_selector|pj }}</code></dd>
+  <dt>下次触发</dt><dd>{{ ts(s.next_due_at) }}{% if s.next_fires %}；之后 {% for t in s.next_fires[1:] %}{{ ts(t) }}{% if not loop.last %}，{% endif %}{% endfor %}{% endif %}</dd>
+  <dt>最近运行</dt><dd>{% if s.last_run_id %}<a href="/runs/{{ s.last_run_id }}">{{ s.last_run_id[:8] }}</a>{% else %}—{% endif %}</dd>
+  <dt>等待原因</dt><dd>{{ s.waiting_reason or "—" }}</dd>
+  {% if s.consecutive_errors %}<dt>连续错误</dt><dd class="warn">{{ s.consecutive_errors }}（退避到 {{ ts(s.backoff_until) }}）</dd>{% endif %}
+</dl>
+{% if s.status != "ARCHIVED" %}
+<div class="actions">
+  {% for a, label in [("ENABLE", "启用"), ("DISABLE", "停用"), ("RESTART", "重新开始"), ("ARCHIVE", "归档")] %}
+  <form method="post" action="/actions/schedules/{{ s.id }}/action" class="inline">
+    <input type="hidden" name="action" value="{{ a }}"><input type="hidden" name="revision" value="{{ s.revision }}">
+    <button type="submit"{% if a == "ARCHIVE" %} class="danger"{% endif %}>{{ label }}</button>
+  </form>
+  {% endfor %}
+</div>
+{% endif %}
+<h2>触发记录</h2>
+<table>
+  <tr><th>计划时间</th><th>触发时间</th><th>结果</th><th>运行</th><th>详情</th></tr>
+  {% for f in s.fires %}
+  <tr><td>{{ ts(f.due_at) }}</td><td>{{ ts(f.fired_at) }}</td><td>{{ m.badge(f.outcome) }}</td>
+    <td>{% if f.run_id %}<a href="/runs/{{ f.run_id }}">{{ f.run_id[:8] }}</a>{% endif %}</td>
+    <td>{% if f.detail %}<code>{{ f.detail|pj }}</code>{% endif %}</td></tr>
+  {% else %}<tr><td colspan="5" class="muted">还没有触发</td></tr>{% endfor %}
+</table>
+{% endblock %}

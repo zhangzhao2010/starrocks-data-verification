@@ -1,0 +1,52 @@
+# srdq 配置示例（srdq-config-v1.3）。未列出的键取内置默认值，完整清单见 docs/03-技术设计.md §15。
+# 未知键、旧版本号和与 v1.3 固定语义冲突的值都会被拒绝；改完先运行 `srdq check-config`。
+spec_version: srdq-config-v1.3
+
+# 首次部署保持 false：只做导入、范围发现、规则批准，不派发业务检查。PoC 准备好后再改为 true。
+run_enabled: false
+
+deployment:
+  mode: CENTRAL                 # 首期只实现 CENTRAL：Controller、Web、两个执行器都在阿里 ECS
+  controller_location: ALIYUN
+
+execution_window:               # 本地时区；可以跨午夜
+  timezone: Asia/Shanghai
+  open_at: "00:00"
+  drain_at: "07:30"             # 之后不再派新工作，已开始的观察可以收尾
+  close_at: "08:00"             # 到点取消并确认终止
+
+execution:
+  concurrency_per_cluster: 2    # 每个集群的初始并发，负载保护只会往下调
+  query_timeout_seconds: 300
+  lease_seconds: 120
+  heartbeat_seconds: 30
+
+transfer:
+  # 客户书面审批编号。保持尖括号占位符时，样本和分组值不会外传，METRIC / SAMPLE 规则显示为 BLOCKED。
+  global_approval_ref: "<待登记：客户书面审批依据>"
+
+retention:
+  raw_value_days: 7
+
+report:
+  dir: /var/lib/srdq/reports
+  grace_minutes: 15
+
+credentials:
+  # 每个 side 一个 0600 凭证文件，属主为该 side 执行器的系统用户；Controller / Web 不能读取。
+  huawei: {connection_ref: sr-huawei-ro, file: /etc/srdq/secrets/huawei.json, os_user: srdq-hw, mode: "0600"}
+  aliyun: {connection_ref: sr-aliyun-ro, file: /etc/srdq/secrets/aliyun.json, os_user: srdq-al, mode: "0600"}
+  controller_pg: {file: /etc/srdq/secrets/pg.json, os_user: srdq-ctl, mode: "0600"}
+
+web:
+  bind_address: 127.0.0.1       # 只能是本机地址；经 SSH 端口转发访问：ssh -L 8470:127.0.0.1:8470 ecs
+  port: 8470
+
+controller:
+  worker_api_bind: 127.0.0.1
+  worker_api_port: 8471
+  data_dir: /var/lib/srdq/controller
+
+executor:
+  controller_url: http://127.0.0.1:8471
+  data_dir: /var/lib/srdq/executor

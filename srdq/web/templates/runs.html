@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<form method="get" class="filters">
+  <select name="purpose"><option value="">全部用途</option>{% for p in ["COMPARE", "MANUAL", "METADATA_PREVIEW"] %}<option{% if query.purpose == p %} selected{% endif %}>{{ p }}</option>{% endfor %}</select>
+  <label><input type="checkbox" name="active" value="1"{% if query.active == "1" %} checked{% endif %}> 只看未结束</label>
+  <button type="submit">筛选</button>
+</form>
+<table>
+  <tr><th>开始</th><th>用途</th><th>计划 / 周期</th><th>执行</th><th>控制</th><th>窗口数</th><th>完成率</th><th>结束</th><th>原因</th></tr>
+  {% for r in data["items"] %}
+  {% set tot = r.progress|sum(attribute="total") %}{% set comp = r.progress|sum(attribute="completed") %}
+  <tr><td><a href="/runs/{{ r.id }}">{{ ts(r.created_at) }}</a></td><td>{{ r.purpose }}</td>
+    <td>{{ r.plan_name or "—" }}{% if r.schedule_name %} / {{ r.schedule_name }}{% endif %}</td>
+    <td>{{ m.badge(r.execution_state) }}</td><td>{{ m.badge(r.control_state) }}</td><td>{{ r.windows_used }}</td>
+    <td>{% if tot %}<progress max="{{ tot }}" value="{{ comp }}"></progress> {{ comp|pct(tot) }}{% else %}—{% endif %}</td>
+    <td>{{ ts(r.completed_at) }}</td><td>{{ r.reason or "" }}</td></tr>
+  {% else %}<tr><td colspan="9" class="muted">没有运行</td></tr>{% endfor %}
+</table>
+{{ m.pager(data) }}
+{% endblock %}

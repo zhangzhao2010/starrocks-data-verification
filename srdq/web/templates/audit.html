@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<form method="get" class="filters">
+  <label>事件 <input type="text" name="event_type" value="{{ query.get('event_type', '') }}"></label>
+  <label>对象类型 <input type="text" name="object_type" value="{{ query.get('object_type', '') }}"></label>
+  <label>对象 ID <input type="text" name="object_id" value="{{ query.get('object_id', '') }}"></label>
+  <label>操作者 <input type="text" name="actor" value="{{ query.get('actor', '') }}"></label>
+  <button type="submit">筛选</button>
+</form>
+<table>
+  <tr><th>#</th><th>时间</th><th>事件</th><th>对象</th><th>操作者</th><th>原因</th><th>内容</th></tr>
+  {% for e in data["items"] %}
+  <tr>
+    <td class="num">{{ e.id }}</td><td>{{ ts(e.created_at) }}</td><td>{{ e.event_type }}</td>
+    <td class="small">{{ e.object_type }} <a href="?object_type={{ e.object_type|urlencode }}&object_id={{ e.object_id|urlencode }}">{{ e.object_id }}</a></td>
+    <td>{{ e.actor or "" }}</td><td>{{ e.reason or "" }}</td>
+    <td>{% if e.payload %}<details><summary>展开</summary>{{ m.json(e.payload) }}</details>{% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="7" class="muted">没有记录</td></tr>{% endfor %}
+</table>
+{{ m.pager(data) }}
+{% endblock %}

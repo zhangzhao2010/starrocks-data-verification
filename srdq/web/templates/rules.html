@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<form method="get" class="filters">
+  <select name="kind"><option value="">全部类型</option>{% for k in KINDS %}<option{% if query.kind == k %} selected{% endif %}>{{ k }}</option>{% endfor %}</select>
+  <select name="status"><option value="">全部状态</option>{% for s in ["DRAFT", "APPROVED", "SUPERSEDED", "ARCHIVED"] %}<option{% if query.status == s %} selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+  <select name="support_state"><option value="">能力不限</option>{% for s in ["SUPPORTED", "UNSUPPORTED"] %}<option{% if query.support_state == s %} selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+  <input type="search" name="q" value="{{ query.q or '' }}" placeholder="库.表 或 rule_key">
+  <button type="submit">筛选</button>
+</form>
+<form method="post" action="/actions/rules/approve">
+<input type="hidden" name="back" value="/rules?{{ qs_without(query) }}">
+<table>
+  <tr><th></th><th>表</th><th>rule_key</th><th>版本</th><th>类型</th><th>状态</th><th>能力</th><th>启用</th><th>外传级别</th><th>审批依据</th><th>创建</th></tr>
+  {% for r in data["items"] %}
+  <tr>
+    <td>{% if r.status == "DRAFT" and r.support_state == "SUPPORTED" %}<input type="checkbox" name="rule_ids" value="{{ r.id }}">{% endif %}</td>
+    <td><a href="/assets/{{ r.asset_id }}">{{ r.source_db }}.{{ r.source_table }}</a></td>
+    <td>{{ r.rule_key }}</td><td>{{ r.revision }}</td><td>{{ r.check_kind }}</td><td>{{ m.badge(r.status) }}</td>
+    <td>{{ m.badge(r.support_state) }}{% if r.support_reason %}<br><span class="muted">{{ r.support_reason }}</span>{% endif %}</td>
+    <td>{{ "是" if r.enabled else "否" }}</td><td>{{ r.transfer_class }}</td><td>{{ r.approval_ref or "—" }}</td>
+    <td>{{ ts(r.created_at) }}</td>
+  </tr>
+  {% else %}<tr><td colspan="11" class="muted">没有规则</td></tr>{% endfor %}
+</table>
+<p><label>审批依据 <input type="text" name="approval_ref" placeholder="线下审批编号（可用全局默认）"></label>
+  {{ m.reason(required=False) }} <button type="submit">批准勾选的规则</button></p>
+</form>
+{{ m.pager(data) }}
+<h2>启用 / 停用</h2>
+<p class="muted">停用的规则不进入新的运行，已冻结的运行不受影响。</p>
+<table>
+  {% for r in data["items"] if r.status == "APPROVED" %}
+  <tr><td>{{ r.source_db }}.{{ r.source_table }}</td><td>{{ r.rule_key }} r{{ r.revision }}</td><td>{{ "启用中" if r.enabled else "已停用" }}</td>
+    <td><form method="post" action="/actions/rules/{{ r.id }}/{{ 'disable' if r.enabled else 'enable' }}" class="inline">
+      <input type="hidden" name="back" value="/rules?{{ qs_without(query) }}">
+      {{ m.reason(required=False) }} <button type="submit">{{ "停用" if r.enabled else "启用" }}</button></form></td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

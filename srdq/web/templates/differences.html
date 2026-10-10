@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% import "macros.html" as m with context %}
+{% block content %}
+<p class="muted">观察到差异即列出（不自动复核）。NEW＝首次出现，PERSISTENT＝连续出现，RESOLVED＝{% if data.resolved_since %}自上次日报（{{ ts(data.resolved_since) }}）以来{% endif %}最近一次观察已相同。</p>
+<form method="get" class="filters">
+  <select name="kind"><option value="">全部类型</option>{% for k in KINDS %}<option{% if query.kind == k %} selected{% endif %}>{{ k }}</option>{% endfor %}</select>
+  <select name="layer"><option value="">全部层级</option>{% for l in LAYERS %}<option{% if query.layer == l %} selected{% endif %}>{{ l }}</option>{% endfor %}</select>
+  <select name="state"><option value="">全部持续状态</option>{% for s in states %}<option{% if query.state == s %} selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+  <input type="search" name="table" value="{{ query.table or '' }}" placeholder="库.表">
+  {% if query.asset_id %}<input type="hidden" name="asset_id" value="{{ query.asset_id }}">{% endif %}
+  <button type="submit">筛选</button>
+</form>
+<table>
+  <tr><th>类型</th><th>层级</th><th>表</th><th>范围</th><th>规则</th><th>状态</th><th>连续次数</th><th>首次</th><th>最近差异</th><th>摘要</th></tr>
+  {% for d in data["items"] %}
+  <tr>
+    <td>{{ d.check_kind }}</td><td>{{ d.layer }}</td>
+    <td><a href="/assets/{{ d.asset_id }}">{{ d.source_table }}</a></td><td>{{ d.scope_label }}</td>
+    <td>{{ d.rule_key }} r{{ d.rule_revision }}</td><td>{{ m.badge(d.state) }}</td><td>{{ d.consecutive_different }}</td>
+    <td>{{ ts(d.first_seen) }}</td><td><a href="/comparisons/{{ d.comparison_id }}">{{ ts(d.last_different_at) }}</a></td>
+    <td>{{ d.summary }}</td>
+  </tr>
+  {% else %}<tr><td colspan="10" class="muted">没有差异</td></tr>{% endfor %}
+</table>
+{{ m.pager(data) }}
+{% endblock %}
