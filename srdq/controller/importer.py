@@ -13,10 +13,10 @@ from ..common import dsl
 from ..db.db import jb, new_id
 from .common import (TRANSFER_CLASS, ApiError, Ctx, as_uuid, audit, digest_json, rule_definition_digest)
 
-ASSET_COLUMNS = ["layer", "source_db", "source_table", "target_db", "target_table", "priority", "enabled"]
-METRIC_COLUMNS = ["source_db", "source_table", "rule_key", "group_by", "filter", "metric_id", "function", "column",
-                  "scale", "compare", "rtol", "atol"]
-SAMPLE_COLUMNS = ["source_db", "source_table", "key_column", "compare_columns", "float_rtol", "float_atol"]
+ASSET_COLUMNS = ["layer", "pair_id", "source_db", "source_table", "target_db", "target_table", "priority", "enabled"]
+METRIC_COLUMNS = ["pair_id", "source_db", "source_table", "rule_key", "group_by", "filter", "metric_id", "function",
+                  "column", "scale", "compare", "rtol", "atol"]
+SAMPLE_COLUMNS = ["pair_id", "source_db", "source_table", "key_column", "compare_columns", "float_rtol", "float_atol"]
 LAYERS = ("ODS", "DWD", "DWS", "ADS", "DIM", "OTHER")
 METRIC_ID_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
 RULE_KEY_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
@@ -104,8 +104,12 @@ def _validate_asset_raw(raw: dict, default_priority: int) -> tuple[dict, list[st
     else:
         enabled = None
         errs.append("enabled must be true/false/1/0")
-    return ({"layer": layer, "source_db": raw["source_db"], "source_table": raw["source_table"],
-             "target_db": raw["target_db"], "target_table": raw["target_table"], "priority": priority,
+    pair_id = raw["pair_id"]
+    if not pair_id:
+        errs.append("pair_id is required")
+    return ({"layer": layer, "pair_id": pair_id, "source_db": raw["source_db"],
+             "source_table": raw["source_table"], "target_db": raw["target_db"],
+             "target_table": raw["target_table"], "priority": priority,
              "enabled": enabled}, errs)
 
 
@@ -118,7 +122,8 @@ def _evaluate_assets(cur, parsed: list[dict], mode: str, default_priority: int) 
         errs = list(p["parse_errors"]) + errs
         row = {"line": p["line"], "values": values, "status": "ERROR", "errors": errs, "asset_id": None,
                "changes": {}}
-        src, tgt = (values["source_db"], values["source_table"]), (values["target_db"], values["target_table"])
+        src = (values["pair_id"], values["source_db"], values["source_table"])
+        tgt = (values["pair_id"], values["target_db"], values["target_table"])
         if src in seen_src:
             errs.append(f"duplicate source table (line {seen_src[src]})")
         if tgt in seen_tgt:
@@ -126,9 +131,14 @@ def _evaluate_assets(cur, parsed: list[dict], mode: str, default_priority: int) 
         seen_src.setdefault(src, p["line"])
         seen_tgt.setdefault(tgt, p["line"])
         if not errs:
-            cur.execute("SELECT * FROM dq_asset WHERE source_db=%s AND source_table=%s", src)
+            cur.execute("SELECT id FROM dq_cluster_pair WHERE id=%s AND enabled", (values["pair_id"],))
+            if cur.fetchone() is None:
+                errs.append(f"unknown or disabled pair_id {values['pair_id']!r}")
+                out.append(row)
+                continue
+            cur.execute("SELECT * FROM dq_asset WHERE pair_id=%s AND source_db=%s AND source_table=%s", src)
             ex = cur.fetchone()
-            cur.execute("SELECT id FROM dq_asset WHERE target_db=%s AND target_table=%s", tgt)
+            cur.execute("SELECT id FROM dq_asset WHERE pair_id=%s AND target_db=%s AND target_table=%s", tgt)
             tex = cur.fetchone()
             if tex and (ex is None or tex["id"] != ex["id"]):
                 errs.append("target table is already paired with another source table")
@@ -201,10 +211,10 @@ def _apply_assets(cur, batch: dict, rows: list[dict]) -> dict:
         v = r["values"]
         if r["status"] == "NEW":
             aid = new_id()
-            cur.execute("""INSERT INTO dq_asset (id, layer, source_db, source_table, target_db, target_table, priority,
-                           enabled, import_batch_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (aid, v["layer"], v["source_db"], v["source_table"], v["target_db"], v["target_table"],
-                         v["priority"], v["enabled"], batch["id"]))
+            cur.execute("""INSERT INTO dq_asset (id, layer, pair_id, source_db, source_table, target_db, target_table,
+                           priority, enabled, import_batch_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (aid, v["layer"], v["pair_id"], v["source_db"], v["source_table"], v["target_db"],
+                         v["target_table"], v["priority"], v["enabled"], batch["id"]))
             cur.execute("INSERT INTO dq_asset_slot (asset_id) VALUES (%s) ON CONFLICT DO NOTHING", (aid,))
             ensure_baseline_rule(cur, aid)
             audit(cur, "ASSET_CREATED", "asset", aid, v)
@@ -306,8 +316,10 @@ def spec_columns(cols: dict, names) -> dict:
             for n in sorted(set(names))}
 
 
-def _asset_and_entry(cur, inv: dict | None, db: str, table: str) -> tuple[dict | None, dict | None, str | None]:
-    cur.execute("SELECT * FROM dq_asset WHERE source_db=%s AND source_table=%s AND status='ACTIVE'", (db, table))
+def _asset_and_entry(cur, inv: dict | None, pair_id: str, db: str,
+                     table: str) -> tuple[dict | None, dict | None, str | None]:
+    cur.execute("SELECT * FROM dq_asset WHERE pair_id=%s AND source_db=%s AND source_table=%s AND status='ACTIVE'",
+                (pair_id, db, table))
     asset = cur.fetchone()
     if asset is None:
         return None, None, "ASSET_NOT_FOUND: table is not in the asset list"
@@ -348,17 +360,18 @@ def _evaluate_metric(cur, ctx: Ctx, parsed: list[dict]) -> list[dict]:
     groups: dict[tuple, list[dict]] = {}
     for p in parsed:
         r = p["raw"]
-        groups.setdefault((r["source_db"], r["source_table"], r["rule_key"]), []).append(p)
+        groups.setdefault((r["pair_id"], r["source_db"], r["source_table"], r["rule_key"]), []).append(p)
     out = []
-    for (db, table, rule_key), items in groups.items():
-        row = {"lines": [p["line"] for p in items], "source_db": db, "source_table": table, "rule_key": rule_key,
+    for (pair_id, db, table, rule_key), items in groups.items():
+        row = {"lines": [p["line"] for p in items], "pair_id": pair_id, "source_db": db,
+               "source_table": table, "rule_key": rule_key,
                "status": "OK", "errors": [], "unsupported": [], "asset_id": None, "definition": None}
         errs, unsup = row["errors"], row["unsupported"]
         for p in items:
             errs += [f"line {p['line']}: {e}" for e in p["parse_errors"]]
         if not RULE_KEY_RE.fullmatch(rule_key or "") or rule_key in RESERVED_RULE_KEYS:
             errs.append("rule_key must match [A-Za-z0-9_]{1,64} and not be a reserved key")
-        asset, entry, why = _asset_and_entry(cur, inv, db, table)
+        asset, entry, why = _asset_and_entry(cur, inv, pair_id, db, table)
         if asset is not None:
             row["asset_id"] = str(asset["id"])
         if why:
@@ -484,14 +497,15 @@ def _evaluate_sample(cur, ctx: Ctx, parsed: list[dict]) -> list[dict]:
     out = []
     for p in parsed:
         r = p["raw"]
-        db, table, key = r["source_db"], r["source_table"], r["key_column"]
-        row = {"lines": [p["line"]], "source_db": db, "source_table": table, "rule_key": "sample", "status": "OK",
-               "errors": list(p["parse_errors"]), "unsupported": [], "asset_id": None, "definition": None}
+        pair_id, db, table, key = r["pair_id"], r["source_db"], r["source_table"], r["key_column"]
+        row = {"lines": [p["line"]], "pair_id": pair_id, "source_db": db, "source_table": table,
+               "rule_key": "sample", "status": "OK", "errors": list(p["parse_errors"]), "unsupported": [],
+               "asset_id": None, "definition": None}
         errs, unsup = row["errors"], row["unsupported"]
-        if (db, table) in seen:
+        if (pair_id, db, table) in seen:
             errs.append("duplicate table in template")
-        seen.add((db, table))
-        asset, entry, why = _asset_and_entry(cur, inv, db, table)
+        seen.add((pair_id, db, table))
+        asset, entry, why = _asset_and_entry(cur, inv, pair_id, db, table)
         if asset is not None:
             row["asset_id"] = str(asset["id"])
         if why:

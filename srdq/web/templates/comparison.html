@@ -15,7 +15,7 @@
 <table>
   <tr><th>集群</th><th>证据</th><th>行数</th><th>字节</th><th>有效性</th><th>读取开始</th><th>读取结束</th><th>query_ref</th><th>原值</th></tr>
   {% for s in c.side_results %}
-  <tr><td>{{ s.side }}</td><td>{{ s.evidence }}</td><td>{{ s.row_count if s.row_count is not none else "—" }}</td><td>{{ s.total_bytes or "—" }}</td>
+  <tr><td>{{ s.cluster_id }}</td><td>{{ s.evidence }}</td><td>{{ s.row_count if s.row_count is not none else "—" }}</td><td>{{ s.total_bytes or "—" }}</td>
     <td>{{ m.badge(s.validity) }}</td><td>{{ ts(s.read_started) }}</td><td>{{ ts(s.read_finished) }}</td><td><code>{{ s.query_ref|pj if s.query_ref else "" }}</code></td>
     <td>{{ "已清理 " ~ ts(s.raw_purged_at) if s.raw_purged_at else "保留中" }}</td></tr>
   {% endfor %}

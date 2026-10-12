@@ -1,4 +1,4 @@
-"""Strict configuration loading (srdq-config-v1.3). Unknown keys and protocol values are rejected."""
+"""Strict configuration loading for fixed multi-cluster verification pairs."""
 from __future__ import annotations
 
 import copy
@@ -9,9 +9,11 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-SPEC_VERSION = "srdq-config-v1.3"
-PROTOCOL_VERSION = "srdq-v1.3"
+SPEC_VERSION = "srdq-config-v1.4"
+PROTOCOL_VERSION = "srdq-v1.4"
 PLACEHOLDER_RE = re.compile(r"^<.*>$")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+POOL_KINDS = ("COUNT", "METRIC", "SAMPLE", "METADATA", "DEEP")
 
 DEFAULTS: dict[str, Any] = {
     "spec_version": SPEC_VERSION,
@@ -20,10 +22,32 @@ DEFAULTS: dict[str, Any] = {
     "temporal_assurance": "NONE",
     "lineage_required": False,
     "production_job_monitoring": False,
+    "physical_clusters": [
+        {
+            "id": "huawei",
+            "name": "Huawei",
+            "cloud": "HUAWEI",
+            "connection_ref": "sr-huawei-ro",
+            "credential_file": "/etc/srdq/secrets/huawei.json",
+            "os_user": "srdq-hw",
+            "concurrency": {"COUNT": 40, "METRIC": 40, "SAMPLE": 40, "METADATA": 2, "DEEP": 2},
+        },
+        {
+            "id": "aliyun",
+            "name": "Aliyun",
+            "cloud": "ALIYUN",
+            "connection_ref": "sr-aliyun-ro",
+            "credential_file": "/etc/srdq/secrets/aliyun.json",
+            "os_user": "srdq-al",
+            "concurrency": {"COUNT": 40, "METRIC": 40, "SAMPLE": 40, "METADATA": 2, "DEEP": 2},
+        },
+    ],
+    "cluster_pairs": [
+        {"id": "legacy", "name": "Legacy", "source_cluster_id": "huawei", "target_cluster_id": "aliyun"},
+    ],
     "deployment": {
         "mode": "CENTRAL",
         "controller_location": "ALIYUN",
-        "logical_executor_sides": ["huawei", "aliyun"],
         "side_isolation": "SEPARATE_PROCESS_AND_IDENTITY",
         "worker_on_huawei_required": False,
     },
@@ -45,7 +69,7 @@ DEFAULTS: dict[str, Any] = {
         "predict_factor": 1.5,
     },
     "load_guard": {
-        "adaptive_concurrency": True,
+        "adaptive_concurrency": False,
         "min_concurrency": 1,
         "timeout_rate_threshold": 0.05,
         "slowdown_factor_threshold": 3.0,
@@ -117,7 +141,6 @@ DEFAULTS: dict[str, Any] = {
         "regenerate_mode": "NEW_RUN",
     },
     "execution": {
-        "concurrency_per_cluster": 40,
         "lease_seconds": 120,
         "heartbeat_seconds": 30,
         "query_timeout_seconds": 300,
@@ -181,10 +204,6 @@ DEFAULTS: dict[str, Any] = {
     },
     "notification": {"channels": ["DASHBOARD", "DAILY_REPORT"]},
     "credentials": {
-        "huawei": {"connection_ref": "sr-huawei-ro", "file": "/etc/srdq/secrets/huawei.json",
-                   "os_user": "srdq-hw", "mode": "0600"},
-        "aliyun": {"connection_ref": "sr-aliyun-ro", "file": "/etc/srdq/secrets/aliyun.json",
-                   "os_user": "srdq-al", "mode": "0600"},
         "controller_pg": {"file": "/etc/srdq/secrets/pg.json", "os_user": "srdq-ctl", "mode": "0600"},
     },
     "schedule_defaults": {
@@ -198,7 +217,7 @@ DEFAULTS: dict[str, Any] = {
         "bind_address": "0.0.0.0",
         "port": 8470,
         "authorization": "NONE",
-        "worker_auth": "SIDE_BOUND_TOKEN",
+        "worker_auth": "CLUSTER_BOUND_TOKEN",
         "max_page_size": 200,
         "operation_preview_required": True,
         "default_masked_values": True,
@@ -227,7 +246,6 @@ _FIXED = {
     ("temporal_assurance",): "NONE",
     ("lineage_required",): False,
     ("production_job_monitoring",): False,
-    ("deployment", "logical_executor_sides"): ["huawei", "aliyun"],
     ("deployment", "side_isolation"): "SEPARATE_PROCESS_AND_IDENTITY",
     ("scheduler", "strategy"): "KIND_THEN_PRIORITY_THEN_LAYER",
     ("scheduler", "kind_order"): ["COUNT", "METRIC", "SAMPLE", "DEEP"],
@@ -272,7 +290,7 @@ _FIXED = {
     ("error_classification", "storage_suspect_auto_pause"): False,
     ("report", "trigger"): "AFTER_WINDOW_CLOSED",
     ("web", "authorization"): "NONE",
-    ("web", "worker_auth"): "SIDE_BOUND_TOKEN",
+    ("web", "worker_auth"): "CLUSTER_BOUND_TOKEN",
 }
 
 
@@ -300,6 +318,23 @@ class Config(dict):
     def transfer_approved(self) -> bool:
         ref = self["transfer"]["global_approval_ref"]
         return bool(ref) and not PLACEHOLDER_RE.match(ref.strip())
+
+    @property
+    def cluster_ids(self) -> tuple[str, ...]:
+        return tuple(c["id"] for c in self["physical_clusters"])
+
+    def cluster(self, cluster_id: str) -> dict:
+        return next(c for c in self["physical_clusters"] if c["id"] == cluster_id)
+
+    def pair(self, pair_id: str) -> dict:
+        return next(p for p in self["cluster_pairs"] if p["id"] == pair_id)
+
+    def pair_for_cluster(self, cluster_id: str) -> dict:
+        return next(p for p in self["cluster_pairs"]
+                    if cluster_id in (p["source_cluster_id"], p["target_cluster_id"]))
+
+    def concurrency(self, cluster_id: str, kind: str) -> int:
+        return int(self.cluster(cluster_id)["concurrency"][kind])
 
 
 def _merge(default: Any, override: Any, path: tuple[str, ...]) -> Any:
@@ -348,12 +383,60 @@ def _hhmm(s: str, name: str) -> int:
 def validate(cfg: dict) -> None:
     if cfg["spec_version"] != SPEC_VERSION:
         raise ConfigError(f"spec_version must be {SPEC_VERSION} (older versions are rejected)")
+    clusters = cfg["physical_clusters"]
+    pairs = cfg["cluster_pairs"]
+    if not isinstance(clusters, list) or not clusters:
+        raise ConfigError("physical_clusters must be a non-empty list")
+    required_cluster = {"id", "name", "cloud", "connection_ref", "credential_file", "os_user", "concurrency"}
+    cluster_ids: list[str] = []
+    for i, cluster in enumerate(clusters):
+        if not isinstance(cluster, dict) or set(cluster) != required_cluster:
+            raise ConfigError(f"physical_clusters[{i}] must contain exactly {sorted(required_cluster)}")
+        cid = cluster["id"]
+        if not isinstance(cid, str) or not ID_RE.fullmatch(cid):
+            raise ConfigError(f"physical_clusters[{i}].id is invalid")
+        cluster_ids.append(cid)
+        for key in ("name", "cloud", "connection_ref", "credential_file", "os_user"):
+            if not isinstance(cluster[key], str) or not cluster[key].strip():
+                raise ConfigError(f"physical_clusters[{i}].{key} must be a non-empty string")
+        concurrency = cluster["concurrency"]
+        if not isinstance(concurrency, dict) or set(concurrency) != set(POOL_KINDS):
+            raise ConfigError(f"physical_clusters[{i}].concurrency must contain exactly {list(POOL_KINDS)}")
+        for kind, limit in concurrency.items():
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ConfigError(f"physical_clusters[{i}].concurrency.{kind} must be a positive integer")
+    if len(cluster_ids) != len(set(cluster_ids)):
+        raise ConfigError("physical cluster ids must be unique")
+    if not isinstance(pairs, list) or not pairs:
+        raise ConfigError("cluster_pairs must be a non-empty list")
+    required_pair = {"id", "name", "source_cluster_id", "target_cluster_id"}
+    pair_ids: list[str] = []
+    assigned: list[str] = []
+    for i, pair in enumerate(pairs):
+        if not isinstance(pair, dict) or set(pair) != required_pair:
+            raise ConfigError(f"cluster_pairs[{i}] must contain exactly {sorted(required_pair)}")
+        pid = pair["id"]
+        if not isinstance(pid, str) or not ID_RE.fullmatch(pid):
+            raise ConfigError(f"cluster_pairs[{i}].id is invalid")
+        if not isinstance(pair["name"], str) or not pair["name"].strip():
+            raise ConfigError(f"cluster_pairs[{i}].name must be a non-empty string")
+        source, target = pair["source_cluster_id"], pair["target_cluster_id"]
+        if source == target or source not in cluster_ids or target not in cluster_ids:
+            raise ConfigError(f"cluster_pairs[{i}] must reference two different physical clusters")
+        pair_ids.append(pid)
+        assigned.extend((source, target))
+    if len(pair_ids) != len(set(pair_ids)):
+        raise ConfigError("cluster pair ids must be unique")
+    if len(assigned) != len(set(assigned)):
+        raise ConfigError("a physical cluster can belong to only one cluster pair")
+    if set(assigned) != set(cluster_ids):
+        raise ConfigError("every physical cluster must belong to exactly one cluster pair")
     for path, want in _FIXED.items():
         v: Any = cfg
         for p in path:
             v = v[p]
         if v != want:
-            raise ConfigError(f"{'.'.join(path)} must be {want!r} in v1.3, got {v!r}")
+            raise ConfigError(f"{'.'.join(path)} must be {want!r} in v1.4, got {v!r}")
     if cfg["deployment"]["mode"] not in ("CENTRAL", "LOCAL"):
         raise ConfigError("deployment.mode must be CENTRAL or LOCAL")
     for tzpath in (("execution_window", "timezone"), ("schedule_defaults", "timezone")):
@@ -392,12 +475,11 @@ def validate(cfg: dict) -> None:
     if not set(cfg["transfer"]["globally_approved_classes"]) <= {"SUMMARY_ONLY", "AGGREGATES_APPROVED",
                                                                "SAMPLE_VALUES_APPROVED"}:
         raise ConfigError("transfer.globally_approved_classes cannot include DETAIL_APPROVED")
-    for side in ("huawei", "aliyun"):
-        if cfg["credentials"][side]["mode"] != "0600":
-            raise ConfigError(f"credentials.{side}.mode must be 0600")
+    if cfg["credentials"]["controller_pg"]["mode"] != "0600":
+        raise ConfigError("credentials.controller_pg.mode must be 0600")
     if cfg["execution"]["heartbeat_seconds"] * 2 > cfg["execution"]["lease_seconds"]:
         raise ConfigError("execution.heartbeat_seconds must be at most half of lease_seconds")
-    for k in ("concurrency_per_cluster", "lease_seconds", "heartbeat_seconds", "batch_rows"):
+    for k in ("lease_seconds", "heartbeat_seconds", "batch_rows"):
         if cfg["execution"][k] <= 0:
             raise ConfigError(f"execution.{k} must be positive")
     if not cfg["error_classification"]["storage_suspect_patterns"]:

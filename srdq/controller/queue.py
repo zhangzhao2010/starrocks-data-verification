@@ -8,11 +8,12 @@ from typing import Any
 from ..common import canonical as c
 from ..db.db import jb, new_id
 from . import budgets, planning, window
-from .common import (LIVE_ATTEMPT, SIDES, ApiError, Ctx, as_uuid, audit, close_incident, digest_json, incident,
+from .common import (LIVE_ATTEMPT, ApiError, Ctx, as_uuid, audit, close_incident, digest_json, incident,
                      iso, lock_control, pg_now, protocol_ok, transfer_allowed)
 
 MAX_CLAIM_ITEMS = 32
 CANDIDATE_LIMIT = 200
+CLAIM_KINDS = ("COUNT", "METRIC", "SAMPLE", "METADATA", "DEEP")
 BLOCKING_STATES = ("CANCELLED", "ARCHIVED")
 
 
@@ -22,11 +23,11 @@ def token_digest(token: str) -> bytes:
     return c.sha256(token.encode("utf-8"))
 
 
-def create_worker(ctx: Ctx, name: str, side: str, execution_location: str = "ALIYUN_ECS",
+def create_worker(ctx: Ctx, name: str, cluster_id: str, execution_location: str = "ALIYUN_ECS",
                   rotate: bool = False) -> dict:
-    """Create a side-bound worker identity (or rotate its token). The token is returned once, never stored."""
-    if side not in SIDES:
-        raise ApiError(422, "BAD_SIDE", f"side must be one of {SIDES}")
+    """Create a cluster-bound worker identity (or rotate its token)."""
+    if cluster_id not in ctx.cfg.cluster_ids:
+        raise ApiError(422, "BAD_CLUSTER", f"unknown physical cluster {cluster_id!r}")
     if not name or len(name) > 64:
         raise ApiError(422, "BAD_NAME", "worker name must be 1..64 characters")
     token = secrets.token_urlsafe(32)
@@ -36,21 +37,22 @@ def create_worker(ctx: Ctx, name: str, side: str, execution_location: str = "ALI
         if w is not None:
             if not rotate:
                 raise ApiError(409, "WORKER_EXISTS", "worker exists; use rotate to issue a new token")
-            if w["side"] != side:
-                raise ApiError(409, "SIDE_MISMATCH", "an existing worker cannot change side")
+            if w["cluster_id"] != cluster_id:
+                raise ApiError(409, "CLUSTER_MISMATCH", "an existing worker cannot change physical cluster")
             cur.execute("UPDATE dq_worker SET token_digest=%s, status='ACTIVE', execution_location=%s WHERE id=%s",
                         (token_digest(token), execution_location, w["id"]))
             cur.execute("UPDATE dq_worker_registration SET status='SUPERSEDED' WHERE worker_id=%s AND status='ACTIVE'",
                         (w["id"],))
             wid = w["id"]
-            audit(cur, "WORKER_TOKEN_ROTATED", "worker", wid, {"name": name, "side": side})
+            audit(cur, "WORKER_TOKEN_ROTATED", "worker", wid, {"name": name, "cluster_id": cluster_id})
         else:
             wid = new_id()
-            cur.execute("""INSERT INTO dq_worker (id, name, side, execution_location, token_digest)
-                           VALUES (%s,%s,%s,%s,%s)""", (wid, name, side, execution_location, token_digest(token)))
-            audit(cur, "WORKER_CREATED", "worker", wid, {"name": name, "side": side,
+            cur.execute("""INSERT INTO dq_worker (id, name, cluster_id, execution_location, token_digest)
+                           VALUES (%s,%s,%s,%s,%s)""",
+                        (wid, name, cluster_id, execution_location, token_digest(token)))
+            audit(cur, "WORKER_CREATED", "worker", wid, {"name": name, "cluster_id": cluster_id,
                                                          "execution_location": execution_location})
-    return {"worker_id": str(wid), "name": name, "side": side, "token": token}
+    return {"worker_id": str(wid), "name": name, "cluster_id": cluster_id, "token": token}
 
 
 def disable_worker(ctx: Ctx, name: str, reason: str | None = None) -> dict:
@@ -78,9 +80,9 @@ def authenticate(ctx: Ctx, token: str | None) -> dict:
 
 def register(ctx: Ctx, worker: dict, body: dict) -> dict:
     protocol_ok(body.get("protocol_version"))
-    side = body.get("side")
-    if side != worker["side"]:
-        raise ApiError(403, "SIDE_MISMATCH", "token is bound to another side")
+    cluster_id = body.get("cluster_id")
+    if cluster_id != worker["cluster_id"]:
+        raise ApiError(403, "CLUSTER_MISMATCH", "token is bound to another physical cluster")
     boot_id = as_uuid(body.get("boot_id"), "boot_id")
     caps = body.get("capabilities") or {}
     if not isinstance(caps, dict):
@@ -101,22 +103,24 @@ def register(ctx: Ctx, worker: dict, body: dict) -> dict:
             cur.execute("UPDATE dq_work_item SET status='CANCEL_PENDING', updated_at=now() "
                         "WHERE id=%s AND current_attempt_id=%s", (r["work_item_id"], r["id"]))
         rid = new_id()
-        cur.execute("""INSERT INTO dq_worker_registration (id, worker_id, side, boot_id, control_generation,
+        cur.execute("""INSERT INTO dq_worker_registration (id, worker_id, cluster_id, boot_id, control_generation,
                        capability_digest, capabilities) VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                    (rid, worker["id"], side, boot_id, ctl["control_generation"], digest_json(caps), jb(caps)))
-        cur.execute("UPDATE dq_source SET capability=%s, updated_at=now() WHERE side=%s", (jb(caps), side))
+                    (rid, worker["id"], cluster_id, boot_id, ctl["control_generation"], digest_json(caps), jb(caps)))
+        cur.execute("UPDATE dq_source SET capability=%s, updated_at=now() WHERE cluster_id=%s",
+                    (jb(caps), cluster_id))
         s1 = (caps.get("s1") or {}).get("status")
         if s1 != "PASS":
-            incident(cur, "CAPABILITY_MISSING", f"{side}:s1", f"S1 pushdown probe on {side}: {s1 or 'MISSING'}",
-                     side=side, detail={"s1": caps.get("s1")})
+            incident(cur, "CAPABILITY_MISSING", f"{cluster_id}:s1",
+                     f"S1 pushdown probe on {cluster_id}: {s1 or 'MISSING'}",
+                     cluster_id=cluster_id, detail={"s1": caps.get("s1")})
         else:
-            close_incident(cur, "CAPABILITY_MISSING", f"{side}:s1")
+            close_incident(cur, "CAPABILITY_MISSING", f"{cluster_id}:s1")
         cur.execute("""SELECT id, query_ref, status FROM dq_attempt WHERE worker_id=%s
                        AND status IN ('CANCEL_REQUESTED','CANCEL_PENDING') ORDER BY claimed_at""", (worker["id"],))
         pending = [{"attempt_id": str(r["id"]), "query_ref": r["query_ref"], "status": r["status"]}
                    for r in cur.fetchall()]
         audit(cur, "WORKER_REGISTERED", "worker", worker["id"],
-              {"registration_id": str(rid), "side": side, "boot_id": str(boot_id), "s1": s1,
+              {"registration_id": str(rid), "cluster_id": cluster_id, "boot_id": str(boot_id), "s1": s1,
                "sr_version": caps.get("sr_version"), "pending": len(pending)}, actor=f"worker:{worker['name']}")
     return {"registration_id": str(rid), "control_generation": str(ctl["control_generation"]),
             "lease_seconds": cfg["execution"]["lease_seconds"],
@@ -140,11 +144,11 @@ def _registration(cur, worker: dict, body: dict, ctl: dict) -> dict:
 
 # ---- claim -----------------------------------------------------------------------------------
 
-def _source_ref(cur, side: str) -> str:
-    cur.execute("SELECT connection_ref FROM dq_source WHERE side=%s", (side,))
+def _source_ref(cur, cluster_id: str) -> str:
+    cur.execute("SELECT connection_ref FROM dq_source WHERE cluster_id=%s", (cluster_id,))
     r = cur.fetchone()
     if r is None:
-        raise ApiError(503, "NOT_INITIALIZED", "source rows are not initialized")
+        raise ApiError(503, "NOT_INITIALIZED", "physical cluster is not initialized")
     return r["connection_ref"]
 
 
@@ -160,10 +164,11 @@ def _lease(cur, ctx: Ctx, worker: dict, reg: dict, ctl: dict, w: dict, source_re
            reservations: list[dict]) -> dict:
     aid = new_id()
     lg = int(w["lease_generation"]) + 1
-    cur.execute("""INSERT INTO dq_attempt (id, work_item_id, registration_id, worker_id, side, control_generation,
-                   lease_generation, lease_expires_at, source_ref, execution_location, window_generation, progress)
+    cur.execute("""INSERT INTO dq_attempt (id, work_item_id, registration_id, worker_id, cluster_id,
+                   control_generation, lease_generation, lease_expires_at, source_ref, execution_location,
+                   window_generation, progress)
                    VALUES (%s,%s,%s,%s,%s,%s,%s, now() + make_interval(secs => %s), %s,%s,%s,%s)""",
-                (aid, w["id"], reg["id"], worker["id"], w["side"], ctl["control_generation"], lg,
+                (aid, w["id"], reg["id"], worker["id"], w["cluster_id"], ctl["control_generation"], lg,
                  ctx.cfg["execution"]["lease_seconds"], source_ref, worker["execution_location"],
                  ctl["window_generation"],
                  jb(budgets.with_entries({}, reservations, read_bytes=0, usage_seq=0))))
@@ -184,13 +189,13 @@ def fail_work(cur, work_id, error_class: str, code: str | None, message: str) ->
                 (jb({"error_class": error_class, "error_code": code, "message": message[:2000]}), work_id))
 
 
-def _p90_ms(cur, side: str, asset_id, scope_key_digest, rule_key: str) -> float | None:
+def _p90_ms(cur, cluster_id: str, asset_id, scope_key_digest, rule_key: str) -> float | None:
     cur.execute("""SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY a.duration_ms) AS p
                    FROM dq_attempt a JOIN dq_work_item w ON w.id = a.work_item_id
                    JOIN dq_run_check rc ON rc.id = w.run_check_id
-                   WHERE a.status='SUCCEEDED' AND a.side=%s AND w.asset_id=%s AND rc.scope_key_digest=%s
+                   WHERE a.status='SUCCEEDED' AND a.cluster_id=%s AND w.asset_id=%s AND rc.scope_key_digest=%s
                      AND rc.rule_key=%s AND a.duration_ms IS NOT NULL AND a.finished_at > now() - interval '30 days'""",
-                (side, asset_id, scope_key_digest, rule_key))
+                (cluster_id, asset_id, scope_key_digest, rule_key))
     r = cur.fetchone()
     return None if r is None or r["p"] is None else float(r["p"])
 
@@ -214,7 +219,10 @@ def claim(ctx: Ctx, worker: dict, body: dict) -> dict:
         max_items = max(1, min(MAX_CLAIM_ITEMS, int(body.get("max_items") or 1)))
     except (TypeError, ValueError) as e:
         raise ApiError(422, "BAD_MAX_ITEMS", "max_items must be an integer") from e
-    side = worker["side"]
+    cluster_id = worker["cluster_id"]
+    claim_kind = body.get("claim_kind")
+    if claim_kind not in CLAIM_KINDS:
+        raise ApiError(422, "BAD_CLAIM_KIND", f"claim_kind must be one of {CLAIM_KINDS}")
     cfg = ctx.cfg
     failed_obs: list = []
     items: list[dict] = []
@@ -226,27 +234,31 @@ def claim(ctx: Ctx, worker: dict, body: dict) -> dict:
         reg = _registration(cur, worker, body, ctl)
         if ctl["queue_revision"] != ctl["queue_materialized_revision"]:
             planning.refresh_queue(cur)
-        cs = (ctl["cluster_state"] or {}).get(side) or {}
         ws = window.window_state(cfg, ctx.now(), ctl["window_override"])
-        if cs.get("hard_stop"):
-            reason = "HARD_STOP"
-        elif ws["state"] == "CLOSED":
+        if ws["state"] == "CLOSED":
             reason = "WINDOW_CLOSED"
         else:
-            limit = int(cs.get("concurrency") or cfg["execution"]["concurrency_per_cluster"])
-            cur.execute("SELECT count(*) AS n FROM dq_attempt WHERE side=%s AND status = ANY(%s)",
-                        (side, list(LIVE_ATTEMPT)))
+            limit = cfg.concurrency(cluster_id, claim_kind)
+            if claim_kind == "METADATA":
+                cur.execute("""SELECT count(*) AS n FROM dq_attempt a JOIN dq_work_item w ON w.id=a.work_item_id
+                               WHERE a.cluster_id=%s AND w.kind='METADATA' AND a.status = ANY(%s)""",
+                            (cluster_id, list(LIVE_ATTEMPT)))
+            else:
+                cur.execute("""SELECT count(*) AS n FROM dq_attempt a JOIN dq_work_item w ON w.id=a.work_item_id
+                               WHERE a.cluster_id=%s AND w.check_kind=%s AND a.status = ANY(%s)""",
+                            (cluster_id, claim_kind, list(LIVE_ATTEMPT)))
             free = min(max_items, limit - int(cur.fetchone()["n"]))
             if free <= 0:
                 reason = "CONCURRENCY"
             else:
-                source_ref = _source_ref(cur, side)
-                items += _claim_metadata(cur, ctx, worker, reg, ctl, free, source_ref)
-                if len(items) < free and cfg["run_enabled"]:
-                    items += _claim_checks(cur, ctx, worker, reg, ctl, ws, free - len(items), source_ref,
-                                           failed_obs)
+                source_ref = _source_ref(cur, cluster_id)
+                if claim_kind == "METADATA":
+                    items += _claim_metadata(cur, ctx, worker, reg, ctl, free, source_ref)
+                elif cfg["run_enabled"]:
+                    items += _claim_checks(cur, ctx, worker, reg, ctl, ws, free, source_ref, failed_obs,
+                                           claim_kind)
                 if not items:
-                    reason = "NO_WORK" if cfg["run_enabled"] else "RUN_DISABLED"
+                    reason = "NO_WORK" if cfg["run_enabled"] or claim_kind == "METADATA" else "RUN_DISABLED"
     for oid in dict.fromkeys(failed_obs):
         evaluate.evaluate_observation(ctx, oid)
     return {"items": items, "reason": reason}
@@ -254,78 +266,104 @@ def claim(ctx: Ctx, worker: dict, body: dict) -> dict:
 
 def _claim_metadata(cur, ctx, worker, reg, ctl, free: int, source_ref: str) -> list[dict]:
     cur.execute("""SELECT w.* FROM dq_work_item w JOIN dq_run r ON r.id = w.run_id
-                   WHERE w.side=%s AND w.kind='METADATA' AND w.status='READY' AND r.control_state='ENABLED'
+                   WHERE w.cluster_id=%s AND w.kind='METADATA' AND w.status='READY' AND r.control_state='ENABLED'
                      AND r.execution_state NOT IN ('COMPLETED','FAILED','CANCELLED')
-                   ORDER BY w.created_at, w.id LIMIT %s FOR UPDATE OF w SKIP LOCKED""", (worker["side"], free))
+                   ORDER BY w.created_at, w.id LIMIT %s FOR UPDATE OF w SKIP LOCKED""",
+                (worker["cluster_id"], free))
     return [_lease(cur, ctx, worker, reg, ctl, w, source_ref, []) for w in cur.fetchall()]
 
 
 def _claim_checks(cur, ctx: Ctx, worker, reg, ctl, ws: dict, free: int, source_ref: str,
-                  failed_obs: list) -> list[dict]:
+                  failed_obs: list, claim_kind: str) -> list[dict]:
     cfg = ctx.cfg
-    side = worker["side"]
+    cluster_id = worker["cluster_id"]
     wcfg = cfg["execution_window"]
-    cur.execute("""SELECT w.*, o.started_at AS obs_started_at, rc.node_id, rc.rule_id, rc.rule_key,
-                          rc.scope_key_digest, rc.execution_snapshot, rc.control_state AS rc_cs,
-                          r.control_state AS run_cs, n.control_state AS node_cs,
-                          COALESCE(p.control_state, 'ENABLED') AS parent_cs
-                   FROM dq_work_item w
-                   JOIN dq_observation o ON o.id = w.observation_id
-                   JOIN dq_run_check rc ON rc.id = w.run_check_id
-                   JOIN dq_run r ON r.id = w.run_id
-                   JOIN dq_task_node n ON n.id = rc.node_id
-                   LEFT JOIN dq_task_node p ON p.id = n.parent_id
-                   WHERE w.side=%s AND w.kind='CHECK' AND w.status='READY' AND o.status='OPEN'
-                     AND r.execution_state NOT IN ('COMPLETED','FAILED','CANCELLED')
-                   ORDER BY (o.started_at IS NOT NULL) DESC, rc.kind_rank, rc.effective_priority DESC,
-                            rc.layer_rank, rc.ready_seq, w.id
-                   LIMIT %s FOR UPDATE OF w SKIP LOCKED""", (side, CANDIDATE_LIMIT))
-    candidates = cur.fetchall()
     s1 = ((reg["capabilities"] or {}).get("s1") or {}).get("status")
     now = ctx.now()
     p90_cache: dict = {}
     out: list[dict] = []
-    for w in candidates:
-        if len(out) >= free:
+    started_observations: list = []
+    started_checks: list = []
+    cursor = None
+    while len(out) < free:
+        cur.execute("""SELECT w.*, o.started_at AS obs_started_at, rc.node_id, rc.rule_id, rc.rule_key,
+                              rc.scope_key_digest, rc.execution_snapshot, rc.control_state AS rc_cs,
+                              rc.effective_priority AS cursor_priority, rc.layer_rank AS cursor_layer_rank,
+                              rc.ready_seq AS cursor_ready_seq,
+                              CASE WHEN o.started_at IS NOT NULL THEN 0 ELSE 1 END AS cursor_started_rank,
+                              r.control_state AS run_cs, n.control_state AS node_cs,
+                              COALESCE(p.control_state, 'ENABLED') AS parent_cs
+                       FROM dq_work_item w
+                       JOIN dq_observation o ON o.id = w.observation_id
+                       JOIN dq_run_check rc ON rc.id = w.run_check_id
+                       JOIN dq_run r ON r.id = w.run_id
+                       JOIN dq_task_node n ON n.id = rc.node_id
+                       LEFT JOIN dq_task_node p ON p.id = n.parent_id
+                       WHERE w.cluster_id=%s AND w.kind IN ('CHECK','DIAGNOSIS') AND w.check_kind=%s
+                         AND w.status='READY' AND o.status='OPEN'
+                         AND (%s::boolean OR
+                              ROW(CASE WHEN o.started_at IS NOT NULL THEN 0 ELSE 1 END,
+                                  -rc.effective_priority, rc.layer_rank, rc.ready_seq, w.id) >
+                              ROW(%s::int, %s::int, %s::int, %s::bigint, %s::uuid))
+                         AND r.execution_state NOT IN ('COMPLETED','FAILED','CANCELLED')
+                       ORDER BY CASE WHEN o.started_at IS NOT NULL THEN 0 ELSE 1 END,
+                                rc.effective_priority DESC, rc.layer_rank, rc.ready_seq, w.id
+                       LIMIT %s FOR UPDATE OF w SKIP LOCKED""",
+                    (cluster_id, claim_kind, cursor is None,
+                     *(cursor or (0, 0, 0, 0, None)), CANDIDATE_LIMIT))
+        candidates = cur.fetchall()
+        if not candidates:
             break
-        states = (w["run_cs"], w["rc_cs"], w["node_cs"], w["parent_cs"])
-        if any(s in BLOCKING_STATES for s in states):
-            continue
-        started = w["obs_started_at"] is not None
-        if not started and ("PAUSED" in states or ws["state"] == "DRAINING"):
-            continue
-        if not started and wcfg["predict_overrun"]:
-            key = (w["asset_id"], bytes(w["scope_key_digest"]), w["rule_key"])
-            if key not in p90_cache:
-                p90_cache[key] = _p90_ms(cur, side, *key)
-            p90 = p90_cache[key]
-            if p90 is not None and now + _dt.timedelta(milliseconds=p90 * float(wcfg["predict_factor"])) \
-                    > ws["close_at"]:
+        last = candidates[-1]
+        cursor = (last["cursor_started_rank"], -last["cursor_priority"], last["cursor_layer_rank"],
+                  last["cursor_ready_seq"], last["id"])
+        for w in candidates:
+            if len(out) >= free:
+                break
+            states = (w["run_cs"], w["rc_cs"], w["node_cs"], w["parent_cs"])
+            if any(s in BLOCKING_STATES for s in states):
                 continue
-        xs = w["execution_snapshot"]
-        if not (transfer_allowed(cfg, xs["transfer_class"], xs.get("detail_approval_ref"))
-                and ctl["transfer_approval_ref"]):
-            continue
-        if w["check_kind"] == "SAMPLE" and s1 != "PASS":
-            if s1 == "UNSUPPORTED_SAMPLE_PUSHDOWN":
-                fail_work(cur, w["id"], "UNSUPPORTED", "SAMPLE_PUSHDOWN_UNSUPPORTED",
-                          f"S1 pushdown probe failed on {side}; SAMPLE cannot run on this cluster")
+            started = w["obs_started_at"] is not None
+            if not started and ("PAUSED" in states or ws["state"] == "DRAINING"):
+                continue
+            if not started and wcfg["predict_overrun"]:
+                key = (w["asset_id"], bytes(w["scope_key_digest"]), w["rule_key"])
+                if key not in p90_cache:
+                    p90_cache[key] = _p90_ms(cur, cluster_id, *key)
+                p90 = p90_cache[key]
+                if p90 is not None and now + _dt.timedelta(milliseconds=p90 * float(wcfg["predict_factor"])) \
+                        > ws["close_at"]:
+                    continue
+            xs = w["execution_snapshot"]
+            if not (transfer_allowed(cfg, xs["transfer_class"], xs.get("detail_approval_ref"))
+                    and ctl["transfer_approval_ref"]):
+                continue
+            if claim_kind == "SAMPLE" and s1 != "PASS":
+                if s1 == "UNSUPPORTED_SAMPLE_PUSHDOWN":
+                    fail_work(cur, w["id"], "UNSUPPORTED", "SAMPLE_PUSHDOWN_UNSUPPORTED",
+                              f"S1 pushdown probe failed on {cluster_id}; SAMPLE cannot run on this cluster")
+                    failed_obs.append(w["observation_id"])
+                continue
+            if not _hold_slot(cur, w["asset_id"], w["run_id"]):
+                continue
+            status, entries = budgets.reserve(cur, w["run_id"], w["node_id"],
+                                               cluster_id == xs["source_cluster_id"], int(xs["result_cap"]))
+            if status == "WAIT":
+                continue
+            if status == "EXCEEDED":
+                fail_work(cur, w["id"], "BUDGET_EXCEEDED", "BUDGET_EXCEEDED", "run/node budget is exhausted")
                 failed_obs.append(w["observation_id"])
-            continue
-        if not _hold_slot(cur, w["asset_id"], w["run_id"]):
-            continue
-        status, entries = budgets.reserve(cur, w["run_id"], w["node_id"], side, int(xs["result_cap"]))
-        if status == "WAIT":
-            continue
-        if status == "EXCEEDED":
-            fail_work(cur, w["id"], "BUDGET_EXCEEDED", "BUDGET_EXCEEDED", "run/node budget is exhausted")
-            failed_obs.append(w["observation_id"])
-            continue
-        out.append(_lease(cur, ctx, worker, reg, ctl, w, source_ref, entries))
-        cur.execute("UPDATE dq_observation SET started_at=COALESCE(started_at, now()) WHERE id=%s",
-                    (w["observation_id"],))
+                continue
+            out.append(_lease(cur, ctx, worker, reg, ctl, w, source_ref, entries))
+            started_observations.append(w["observation_id"])
+            started_checks.append(w["run_check_id"])
+        if len(candidates) < CANDIDATE_LIMIT:
+            break
+    if started_observations:
+        cur.execute("UPDATE dq_observation SET started_at=COALESCE(started_at, now()) WHERE id = ANY(%s)",
+                    (started_observations,))
         cur.execute("UPDATE dq_run_check SET execution_state='RUNNING', updated_at=now() "
-                    "WHERE id=%s AND execution_state='READY'", (w["run_check_id"],))
+                    "WHERE id = ANY(%s) AND execution_state='READY'", (started_checks,))
     return out
 
 
@@ -343,8 +381,9 @@ def expire_attempt(cur, attempt: dict, reason: str = "LEASE_EXPIRED") -> None:
                    WHERE id=%s AND status = ANY(%s)""", (reason, attempt["id"], list(LIVE_ATTEMPT)))
     cur.execute("UPDATE dq_work_item SET status='CANCEL_PENDING', updated_at=now() "
                 "WHERE id=%s AND current_attempt_id=%s", (attempt["work_item_id"], attempt["id"]))
-    incident(cur, "LEASE_EXPIRED", attempt["side"], f"lease expired for attempts on {attempt['side']}",
-             side=attempt["side"], detail={"last_attempt_id": str(attempt["id"])})
+    cluster_id = attempt["cluster_id"]
+    incident(cur, "LEASE_EXPIRED", cluster_id, f"lease expired for attempts on {cluster_id}",
+             cluster_id=cluster_id, detail={"last_attempt_id": str(attempt["id"])})
 
 
 def cancel_live(cur, reason: str, *, run_id=None, node_id=None, observation_id=None) -> int:
@@ -397,7 +436,11 @@ def account_usage(cur, attempt: dict, read_bytes: int, seq: int | None) -> None:
     prev = int(prog.get("read_bytes", 0))
     entries = budgets.progress_entries(prog)
     newly = []
-    if read_bytes > prev and attempt["side"] == "huawei":
+    cur.execute("""SELECT p.source_cluster_id FROM dq_work_item w
+                   JOIN dq_asset a ON a.id=w.asset_id JOIN dq_cluster_pair p ON p.id=a.pair_id
+                   WHERE w.id=%s""", (attempt["work_item_id"],))
+    pair = cur.fetchone()
+    if read_bytes > prev and pair is not None and attempt["cluster_id"] == pair["source_cluster_id"]:
         newly = budgets.consume(cur, entries, "TRANSFER_BYTES", read_bytes - prev)
     new_prog = budgets.with_entries(prog, entries, read_bytes=max(prev, read_bytes),
                                     usage_seq=int(prog.get("usage_seq", 0)) if seq is None else seq)
@@ -456,9 +499,9 @@ def heartbeat(ctx: Ctx, worker: dict, body: dict) -> dict:
         signals = body.get("signals")
         if isinstance(signals, dict):
             cs = dict(ctl["cluster_state"] or {})
-            side_state = dict(cs.get(worker["side"]) or {})
-            side_state["signals"] = {**{k: v for k, v in signals.items() if isinstance(k, str)},
-                                     "at": iso(ctx.now())}
-            cs[worker["side"]] = side_state
+            cluster_state = dict(cs.get(worker["cluster_id"]) or {})
+            cluster_state["signals"] = {**{k: v for k, v in signals.items() if isinstance(k, str)},
+                                        "at": iso(ctx.now())}
+            cs[worker["cluster_id"]] = cluster_state
             cur.execute("UPDATE dq_control_state SET cluster_state=%s WHERE id=1", (jb(cs),))
     return {"directives": directives}

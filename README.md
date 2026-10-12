@@ -1,6 +1,6 @@
-# srdq：StarRocks 双云数据校验
+# srdq：StarRocks 多集群双云数据校验
 
-在华为云和阿里云的两套 StarRocks 之间持续做只读校验，给出数据是否一致的证据。
+在华为云和阿里云的三组固定配对 StarRocks 集群之间持续做只读校验，给出数据是否一致的证据。每个逻辑资产只属于一个校验组，不支持跨组比较。
 
 - **三档检查**
   - COUNT：分区行数。
@@ -8,6 +8,7 @@
   - SAMPLE：按主键哈希分桶抽样，逐行比对。
 - **工作方式**
   - 在每天的执行窗口内自动运行。
+  - 每个物理集群的 COUNT、METRIC、SAMPLE、METADATA、DEEP 使用独立并发池并行执行。
   - 差异出现在本机看板上，并写入日报文件。
   - 不对外发送任何通知。
 
@@ -19,13 +20,12 @@
 |---|---|---|
 | `srdq controller` | srdq-ctl | 调度循环，以及面向执行器的 API（127.0.0.1:8471）。负责写 PG 控制库、比较结果、生成报告 |
 | `srdq web` | srdq-ctl | 看板和 REST API（0.0.0.0:8470）。单用户，无登录，可直接用 ECS IP 访问 |
-| `srdq executor --side huawei` | srdq-hw | 只持有华为 SR 的只读凭证，执行只读查询，上传计数、汇总和样本指纹 |
-| `srdq executor --side aliyun` | srdq-al | 同上，负责阿里云 |
+| `srdq executor --cluster-id C` | 每集群独立用户 | 每个物理集群一个实例，只持有该集群的只读凭证，执行只读查询并上传结果 |
 
 各进程的凭证互相隔离：
 
 - Controller 和 Web 读不到任何 SR 凭证，启动时会自检，能读到就拒绝启动。
-- 每个执行器只能读自己这一侧的凭证文件。
+- 每个执行器只能读自己物理集群的凭证文件。
 - PG 凭证只给 srdq-ctl。
 
 ## 本地开发
@@ -41,12 +41,12 @@ uv run python scripts/demo.py     # 本地演示，数据目录默认 /tmp/srdq-
 `demo.py` 会依次完成以下准备，然后启动 4 个真实的 srdq 进程：
 
 1. 拉起本地 PG。
-2. 生成两个模拟 SR 集群（文件存储），预置三张表：
+2. 生成一组两个模拟 SR 集群（文件存储），预置三张表：
    - `ods.orders`：主键表，7 个日期分区。目标端少了 id=17，id=1001 的金额被改过。
    - `ods.customers`：UNQ_KEYS，字符串主键。
    - `dwd.order_detail`：明细表。
 3. 执行 `srdq migrate`。
-4. 为两侧执行器各签发一个 worker token。
+4. 为两个模拟集群的执行器各签发一个 worker token。
 5. 导入资产清单。
 
 演示的其余步骤在浏览器中完成（打开 http://127.0.0.1:8470）：
@@ -80,14 +80,17 @@ uv run python scripts/demo.py     # 本地演示，数据目录默认 /tmp/srdq-
    /secure/srdq-prod/
    ├── config.yaml
    └── secrets/
-       ├── huawei.json
-       ├── aliyun.json
-       ├── huawei-ca.pem    # 使用自定义 CA 时才需要
-       └── aliyun-ca.pem
+       ├── huawei-1.json
+       ├── aliyun-1.json
+       ├── huawei-2.json
+       ├── aliyun-2.json
+       ├── huawei-3.json
+       ├── aliyun-3.json
+       └── <cluster>-ca.pem  # 使用自定义 CA 时才需要
    ```
 
-   - `config.yaml` 可从 `deploy/config.example.yaml` 复制，必须设置 `run_enabled: true`、真实的 `transfer.global_approval_ref` 和生产连接信息；两侧凭证路径必须分别是 `/etc/srdq/secrets/huawei.json`、`/etc/srdq/secrets/aliyun.json`。
-   - 两个 JSON 可参考 `deploy/secrets/side.json.example`，填写只读 StarRocks 账号，但删除 `worker_token`；安装程序会生成令牌并安全写入。
+   - `config.yaml` 可从 `deploy/config.example.yaml` 复制，必须设置 `run_enabled: true`、真实的 `transfer.global_approval_ref`、六个 `physical_clusters` 和三个固定 `cluster_pairs`。
+   - 六个 JSON 可参考 `deploy/secrets/side.json.example`，分别填写只读 StarRocks 账号，但删除 `worker_token`；安装程序会为每个物理集群生成令牌并安全写入。
    - `ssl_ca` 如有配置，必须指向 `/etc/srdq/secrets/` 下同时打包的 CA 文件。
 
 2. **构建包含生产配置的离线包**
@@ -105,13 +108,13 @@ uv run python scripts/demo.py     # 本地演示，数据目录默认 /tmp/srdq-
    scp -J <user>@<jump-host> dist/srdq-offline-*.tar.gz* <user>@<ecs>:/tmp/
    # 在 ECS 上：
    cd /tmp
-   VERSION=0.1.0
+   VERSION=1.4.0
    sha256sum -c "srdq-offline-${VERSION}-alinux4-x86_64.tar.gz.sha256"
    tar xzf "srdq-offline-${VERSION}-alinux4-x86_64.tar.gz"
    sudo "./srdq-offline-${VERSION}/deploy/install.sh"
    ```
 
-   安装脚本自动写入配置和凭证、创建隔离用户、初始化仅开放 Unix socket 的 PostgreSQL、迁移数据库、生成执行器令牌，并立即启动 controller、web、两个 executor 和每日备份 timer。生产机不需要再编辑文件或执行初始化命令。安装成功后应删除 `/tmp` 中含凭证的压缩包和解压目录。
+   安装脚本自动写入配置和凭证、创建隔离用户、初始化仅开放 Unix socket 的 PostgreSQL、迁移数据库、生成执行器令牌，并立即启动 controller、web、六个 executor 和每日备份 timer。生产机不需要再编辑文件或执行初始化命令。安装成功后应删除 `/tmp` 中含凭证的压缩包和解压目录。
 
    程序安装到 `/opt/srdq/releases/<版本>`，`/opt/srdq/current` 原子指向当前版本；数据库和历史数据保存在 `/var/lib/srdq`，不会随代码替换。PostgreSQL 凭证由安装脚本生成，不含密码，只允许 `srdq-ctl` 通过本机 socket 使用。
 
@@ -158,9 +161,9 @@ sudo -u srdq-ctl env SRDQ_CONFIG=/etc/srdq/config.yaml /opt/srdq/current/venv/bi
 | `srdq check-config` | 校验配置和凭证文件权限 |
 | `srdq migrate` | 执行数据库迁移 |
 | `srdq controller [--dev]` / `srdq web [--dev]` | 启动服务。`--dev` 跳过 SR 凭证隔离自检，只用于开发机 |
-| `srdq executor --side S [--token-file F] [--data-dir D] [--sim DIR] [--dev]` | 启动一侧执行器。控制器暂时不可达时按指数退避重试 |
-| `srdq worker-token create --name N --side S [--rotate] [--out F]` / `disable --name N --reason R` | 管理执行器身份 |
-| `srdq import assets\|metric\|sample FILE [--mode UPDATE_EXPLICIT] [--confirm --reason R]` | 预览导入，可选直接确认。有 ERROR 行时不会确认 |
+| `srdq executor --cluster-id C [--token-file F] [--data-dir D] [--sim DIR] [--dev]` | 启动一个物理集群的执行器。控制器暂时不可达时按指数退避重试 |
+| `srdq worker-token create --name N --cluster-id C [--rotate] [--out F]` / `disable --name N --reason R` | 管理执行器身份 |
+| `srdq import assets\|metric\|sample FILE [--mode UPDATE_EXPLICIT] [--confirm --reason R]` | 预览导入，可选直接确认；CSV 必须包含 `pair_id`，有 ERROR 行时不会确认 |
 | `srdq recovery enter\|confirm --reason R` | 进入或确认恢复 |
 | `srdq report stage --start D --end D --reason R` / `regenerate-daily KEY --reason R` | 生成阶段报告、重新生成日报 |
 | `srdq tick` / `srdq status` | 手动执行一次调度 / 打印看板摘要 |

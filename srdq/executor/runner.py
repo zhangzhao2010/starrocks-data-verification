@@ -49,9 +49,11 @@ def dir_size(path: Path) -> int:
 
 
 class Executor:
-    def __init__(self, cfg, side: str, adapter, client: WorkerClient, data_dir: str | Path):
+    CLAIM_KINDS = ("COUNT", "METRIC", "SAMPLE", "METADATA", "DEEP")
+
+    def __init__(self, cfg, cluster_id: str, adapter, client: WorkerClient, data_dir: str | Path):
         self.cfg = cfg
-        self.side = side
+        self.cluster_id = cluster_id
         self.adapter = adapter
         self.client = client
         self.data_dir = Path(data_dir)
@@ -59,7 +61,7 @@ class Executor:
         self.material_dir.mkdir(parents=True, exist_ok=True)
         self.outbox = Outbox(self.data_dir / "outbox.sqlite")
         ex = cfg["execution"]
-        self.concurrency = int(ex["concurrency_per_cluster"])
+        self.limits = {kind: cfg.concurrency(cluster_id, kind) for kind in self.CLAIM_KINDS}
         self.poll_seconds = float(cfg["executor"]["poll_seconds"])
         self.heartbeat_seconds = float(ex["heartbeat_seconds"])
         self.lease_seconds = float(ex["lease_seconds"])
@@ -75,8 +77,13 @@ class Executor:
         self.active: dict[str, Active] = {}
         self.unconfirmed: dict[str, dict] = {}
         self._lock = threading.Lock()
+        self._register_lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._stop = threading.Event()
-        self._pool = ThreadPoolExecutor(max_workers=max(1, self.concurrency), thread_name_prefix=f"srdq-{side}")
+        self._pools = {kind: ThreadPoolExecutor(max_workers=self.limits[kind],
+                                               thread_name_prefix=f"srdq-{cluster_id}-{kind.lower()}")
+                       for kind in self.CLAIM_KINDS}
+        self._futures: dict[str, object] = {}
         self._threads: list[threading.Thread] = []
         self._last_hb_ok = time.monotonic()
         self._last_signals = 0.0
@@ -86,7 +93,8 @@ class Executor:
     # ---- lifecycle -------------------------------------------------------------
     def probe_capabilities(self) -> dict:
         caps = {"adapter": type(self.adapter).__name__, "compiler_release": probe.COMPILER_RELEASE,
-                "protocol_version": PROTOCOL_VERSION}
+                "protocol_version": PROTOCOL_VERSION, "claim_kinds": list(self.CLAIM_KINDS),
+                "kind_limits": self.limits}
         try:
             caps["sr_version"] = self.adapter.version()
         except AdapterError as e:
@@ -98,45 +106,59 @@ class Executor:
         self._probed_at = time.monotonic()
         return caps
 
-    def register(self) -> None:
-        self.capabilities = self.probe_capabilities()
-        resp = self.client.register(self.boot_id, self.side, self.capabilities)
-        self.registration_id = resp["registration_id"]
-        self.generation = resp["control_generation"]
-        self.lease_seconds = float(resp.get("lease_seconds", self.lease_seconds))
-        self.heartbeat_seconds = float(resp.get("heartbeat_seconds", self.heartbeat_seconds))
-        self._last_hb_ok = time.monotonic()
-        for p in resp.get("pending", []):
-            ref = p.get("query_ref") or self.outbox.journal_ref(p["attempt_id"])
-            with self._lock:
-                if p["attempt_id"] not in self.active:
-                    self.unconfirmed[p["attempt_id"]] = {"query_ref": ref, "cancel_sent": False}
-        log.info("registered side=%s registration=%s s1=%s", self.side, self.registration_id,
-                 self.capabilities["s1"]["status"])
+    def register(self, expected: tuple[str | None, str | None] | None = None) -> bool:
+        with self._register_lock:
+            if expected is not None and (self.registration_id, self.generation) != expected:
+                return False
+            self.capabilities = self.probe_capabilities()
+            resp = self.client.register(self.boot_id, self.cluster_id, self.capabilities)
+            self.registration_id = resp["registration_id"]
+            self.generation = resp["control_generation"]
+            self.lease_seconds = float(resp.get("lease_seconds", self.lease_seconds))
+            self.heartbeat_seconds = float(resp.get("heartbeat_seconds", self.heartbeat_seconds))
+            self._last_hb_ok = time.monotonic()
+            for pending in resp.get("pending", []):
+                ref = pending.get("query_ref") or self.outbox.journal_ref(pending["attempt_id"])
+                with self._lock:
+                    if pending["attempt_id"] not in self.active:
+                        self.unconfirmed[pending["attempt_id"]] = {"query_ref": ref, "cancel_sent": False}
+            log.info("registered cluster=%s registration=%s s1=%s", self.cluster_id, self.registration_id,
+                     self.capabilities["s1"]["status"])
+            return True
 
     def start(self) -> None:
         self.register()
         self.flush_outbox()
-        for target, name in ((self._claim_loop, "claim"), (self._heartbeat_loop, "heartbeat")):
-            t = threading.Thread(target=target, name=f"srdq-{self.side}-{name}", daemon=True)
+        for kind in self.CLAIM_KINDS:
+            t = threading.Thread(target=self._claim_loop, args=(kind,),
+                                 name=f"srdq-{self.cluster_id}-claim-{kind.lower()}", daemon=True)
             t.start()
             self._threads.append(t)
+        heartbeat = threading.Thread(target=self._heartbeat_loop,
+                                     name=f"srdq-{self.cluster_id}-heartbeat", daemon=True)
+        heartbeat.start()
+        self._threads.append(heartbeat)
 
     def request_stop(self) -> None:
         self._stop.set()
 
     def stop(self, timeout: float = 30) -> None:
         self._stop.set()
-        with self._lock:
-            acts = list(self.active.values())
-        for a in acts:
-            a.cancel_reason = a.cancel_reason or "EXECUTOR_STOP"
-            self._request_cancel(a)
+        self._cancel_active("EXECUTOR_STOP")
         for t in self._threads:
             t.join(timeout)
-        self._pool.shutdown(wait=True, cancel_futures=True)
+        self._cancel_active("EXECUTOR_STOP")
+        for pool in self._pools.values():
+            pool.shutdown(wait=True)
         self.outbox.close()
         self.client.close()
+
+    def _cancel_active(self, reason: str) -> None:
+        with self._lock:
+            acts = list(self.active.values())
+        for active in acts:
+            active.cancel_reason = active.cancel_reason or reason
+            self._request_cancel(active)
 
     def run_forever(self) -> None:
         delay = 1.0
@@ -161,44 +183,56 @@ class Executor:
     def _quota_ok(self) -> bool:
         return dir_size(self.material_dir) < self.material_quota and self.outbox.size_bytes() < self.outbox_quota
 
-    def _claim_loop(self) -> None:
+    def _claim_loop(self, claim_kind: str) -> None:
         while not self._stop.is_set():
+            expected = (self.registration_id, self.generation)
             try:
-                self.claim_once()
+                self.claim_once(claim_kind)
             except ApiRejected as e:
                 if e.code in ("REGISTRATION_STALE", "GENERATION_MISMATCH", "UNKNOWN_REGISTRATION"):
-                    self._reregister()
+                    self._reregister(expected)
                 else:
-                    log.debug("claim rejected: %s", e)
+                    log.debug("%s claim rejected: %s", claim_kind, e)
             except Exception as e:  # noqa: BLE001 - keep the loop alive across transient errors
-                log.warning("claim loop error: %s", e)
+                log.warning("%s claim loop error: %s", claim_kind, e)
             self._stop.wait(self.poll_seconds)
 
-    def _reregister(self) -> None:
+    def _reregister(self, expected: tuple[str | None, str | None]) -> None:
         try:
-            self.register()
+            self.register(expected)
         except Exception as e:  # noqa: BLE001
             log.warning("re-registration failed: %s", e)
 
-    def claim_once(self) -> int:
+    def claim_once(self, claim_kind: str | None = None) -> int:
+        if claim_kind is None:
+            return sum(self.claim_once(kind) for kind in self.CLAIM_KINDS)
+        if claim_kind not in self.CLAIM_KINDS:
+            raise ValueError(f"unknown claim kind {claim_kind}")
         if self.registration_id is None:
             self.register()
         if self.capabilities.get("s1", {}).get("status") == "PROBE_ERROR" \
                 and time.monotonic() - self._probed_at > REPROBE_SECONDS:
-            self.register()
+            self.register((self.registration_id, self.generation))
         self.flush_outbox()
         with self._lock:
-            free = self.concurrency - len(self.active)
+            active_for_kind = sum(1 for active in self.active.values() if self._active_kind(active) == claim_kind)
+            free = self.limits[claim_kind] - active_for_kind
         if free <= 0 or not self._quota_ok():
             return 0
-        resp = self.client.claim(self.registration_id, self.generation, free)
+        resp = self.client.claim(self.registration_id, self.generation, free, claim_kind)
         items = resp.get("items", [])
         for item in items:
-            a = Active(item)
+            active = Active(item)
             with self._lock:
-                self.active[a.attempt_id] = a
-            self._pool.submit(self._execute, a)
+                self.active[active.attempt_id] = active
+            future = self._pools[claim_kind].submit(self._execute, active)
+            with self._lock:
+                self._futures[active.attempt_id] = future
         return len(items)
+
+    @staticmethod
+    def _active_kind(active: Active) -> str:
+        return "METADATA" if active.item["kind"] == "METADATA" else active.item["check_kind"]
 
     # ---- execution -----------------------------------------------------------------
     def _execute(self, a: Active) -> None:
@@ -207,6 +241,8 @@ class Executor:
         spec = item["spec"]
         workdir = self.material_dir / aid
         try:
+            if a.cancel.is_set():
+                raise tasks.Cancelled()
             if spec["kind"] == "METADATA":
                 meta = tasks.run_metadata(spec, self.adapter)
                 envelope = self._envelope(item, "METADATA", [], metadata=meta, bytes_read=0)
@@ -248,6 +284,7 @@ class Executor:
         finally:
             with self._lock:
                 self.active.pop(aid, None)
+                self._futures.pop(aid, None)
             if self.outbox.get(aid) is None or self.outbox.get(aid)["state"] != "PENDING_ACK":
                 shutil.rmtree(workdir, ignore_errors=True)
 
@@ -265,7 +302,7 @@ class Executor:
             "run_check_id": item.get("run_check_id"),
             "scan_unit_id": item.get("scan_unit_id"),
             "rule_id": item.get("rule_id"),
-            "side": self.side,
+            "cluster_id": self.cluster_id,
             "result_kind": result_kind,
             "check_kind": item.get("check_kind"),
             "members": members,
@@ -284,8 +321,13 @@ class Executor:
                 self.client.upload_chunk(aid, m.node_id, int(ch["chunk_no"]), path, ch["sha256"])
 
     def flush_outbox(self) -> None:
-        for p in self.outbox.pending():
-            self._send(p["attempt_id"], p)
+        if not self._flush_lock.acquire(blocking=False):
+            return
+        try:
+            for pending in self.outbox.pending():
+                self._send(pending["attempt_id"], pending)
+        finally:
+            self._flush_lock.release()
 
     def _send(self, aid: str, pending: dict | None = None) -> None:
         if pending is None:
@@ -398,34 +440,39 @@ class Executor:
             attempts.append({"attempt_id": a.attempt_id, "lease_generation": a.item["lease_generation"],
                              "query_ref": a.query_ref, "usage": {"READ_BYTES": str(a.usage_bytes)},
                              "usage_seq": a.usage_seq})
+        batches = [attempts[i:i + 256] for i in range(0, len(attempts), 256)] or [[]]
+        expected = (self.registration_id, self.generation)
         try:
-            resp = self.client.heartbeat(self.registration_id, self.generation, attempts, signals)
-            self._last_hb_ok = time.monotonic()
+            for index, batch in enumerate(batches):
+                resp = self.client.heartbeat(expected[0], expected[1], batch, signals if index == 0 else None)
+                self._last_hb_ok = time.monotonic()
+                self._apply_directives(resp.get("directives") or {})
         except ApiRejected as e:
             if e.code in ("REGISTRATION_STALE", "GENERATION_MISMATCH", "UNKNOWN_REGISTRATION"):
-                for a in acts:
-                    a.lease_lost = True
-                    self._request_cancel(a)
-                self._reregister()
+                for active in acts:
+                    active.lease_lost = True
+                    self._request_cancel(active)
+                self._reregister(expected)
             return
         except Exception:  # noqa: BLE001 - controller unreachable
             if time.monotonic() - self._last_hb_ok > self.lease_seconds:
-                for a in acts:
-                    a.lease_lost = True
-                    a.cancel_reason = "HEARTBEAT_LOST"
-                    self._request_cancel(a)
+                for active in acts:
+                    active.lease_lost = True
+                    active.cancel_reason = "HEARTBEAT_LOST"
+                    self._request_cancel(active)
             self._retry_unconfirmed()
             return
-        for aid, directive in (resp.get("directives") or {}).items():
-            with self._lock:
-                a = self.active.get(aid)
-            if a is None:
-                continue
-            if directive in ("CANCEL", "LEASE_LOST"):
-                a.lease_lost = directive == "LEASE_LOST"
-                a.cancel_reason = directive
-                self._request_cancel(a)
         self._retry_unconfirmed()
+
+    def _apply_directives(self, directives: dict[str, str]) -> None:
+        for aid, directive in directives.items():
+            with self._lock:
+                active = self.active.get(aid)
+            if active is None or directive not in ("CANCEL", "LEASE_LOST"):
+                continue
+            active.lease_lost = directive == "LEASE_LOST"
+            active.cancel_reason = directive
+            self._request_cancel(active)
 
     def _retry_unconfirmed(self) -> None:
         with self._lock:

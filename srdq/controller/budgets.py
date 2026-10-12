@@ -4,14 +4,15 @@ from __future__ import annotations
 from typing import Any
 
 
-def _needed(side: str) -> tuple[str, ...]:
-    return ("RESULT_BYTES", "TRANSFER_BYTES") if side == "huawei" else ("RESULT_BYTES",)
+def _needed(transfer_required: bool) -> tuple[str, ...]:
+    return ("RESULT_BYTES", "TRANSFER_BYTES") if transfer_required else ("RESULT_BYTES",)
 
 
-def reserve(cur, run_id, node_id, side: str, cap: int) -> tuple[str, list[dict]]:
+def reserve(cur, run_id, node_id, transfer_required: bool, cap: int) -> tuple[str, list[dict]]:
     """Returns ("OK", entries) | ("WAIT", []) | ("EXCEEDED", [])."""
     cur.execute("""SELECT * FROM dq_budget WHERE run_id=%s AND (level='RUN' OR node_id=%s) AND resource = ANY(%s)
-                   ORDER BY level DESC, resource FOR UPDATE""", (run_id, node_id, list(_needed(side))))
+                   ORDER BY level DESC, resource FOR UPDATE""",
+                (run_id, node_id, list(_needed(transfer_required))))
     rows = cur.fetchall()
     for b in rows:
         if b["budget_state"] != "OPEN":

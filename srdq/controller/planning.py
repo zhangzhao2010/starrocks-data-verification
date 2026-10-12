@@ -6,7 +6,7 @@ from typing import Any
 from ..common import canonical as c
 from ..common import dsl
 from ..db.db import jb, new_id
-from .common import (KIND_RANK, LAYER_RANK, SIDES, TRANSFER_CLASS, ApiError, Ctx, as_uuid, audit, digest_json,
+from .common import (KIND_RANK, LAYER_RANK, TRANSFER_CLASS, ApiError, Ctx, as_uuid, audit, digest_json,
                      lock_control, transfer_allowed)
 from .importer import common_columns, spec_columns
 from .manifest import confirmed_manifest
@@ -50,8 +50,8 @@ def validate_asset_selector(sel: Any) -> dict:
     if sel is None:
         return {"all": True}
     if not isinstance(sel, dict) or len(sel) != 1:
-        raise ApiError(422, "BAD_ASSET_SELECTOR", 'asset_selector is {"all": true}, {"asset_ids": [...]} or '
-                                                  '{"layers": [...]}')
+        raise ApiError(422, "BAD_ASSET_SELECTOR", 'asset_selector is {"all": true}, {"asset_ids": [...]}, '
+                                                  '{"layers": [...]} or {"pair_ids": [...]}')
     if sel.get("all") is True:
         return {"all": True}
     if "asset_ids" in sel:
@@ -64,6 +64,12 @@ def validate_asset_selector(sel: Any) -> dict:
         if not isinstance(ls, list) or not ls or not set(ls) <= set(LAYER_RANK):
             raise ApiError(422, "BAD_ASSET_SELECTOR", f"layers must be a subset of {list(LAYER_RANK)}")
         return {"layers": sorted(set(ls), key=LAYER_RANK.get)}
+    if "pair_ids" in sel:
+        pair_ids = sel["pair_ids"]
+        if not isinstance(pair_ids, list) or not pair_ids \
+                or not all(isinstance(x, str) and x for x in pair_ids):
+            raise ApiError(422, "BAD_ASSET_SELECTOR", "pair_ids must be a non-empty list of strings")
+        return {"pair_ids": sorted(set(pair_ids))}
     raise ApiError(422, "BAD_ASSET_SELECTOR", "unknown asset_selector")
 
 
@@ -73,6 +79,14 @@ def select_assets(cur, sel: dict) -> list[dict]:
                     (sel["asset_ids"],))
     elif sel.get("layers"):
         cur.execute("SELECT * FROM dq_asset WHERE status='ACTIVE' AND layer = ANY(%s) ORDER BY id", (sel["layers"],))
+    elif sel.get("pair_ids"):
+        cur.execute("SELECT id FROM dq_cluster_pair WHERE id = ANY(%s)", (sel["pair_ids"],))
+        found = {r["id"] for r in cur.fetchall()}
+        missing = set(sel["pair_ids"]) - found
+        if missing:
+            raise ApiError(422, "UNKNOWN_CLUSTER_PAIR", f"unknown cluster pairs: {sorted(missing)}")
+        cur.execute("SELECT * FROM dq_asset WHERE status='ACTIVE' AND pair_id = ANY(%s) ORDER BY id",
+                    (sel["pair_ids"],))
     else:
         cur.execute("SELECT * FROM dq_asset WHERE status='ACTIVE' ORDER BY id")
     return cur.fetchall()
@@ -418,8 +432,14 @@ def build_run(cur, ctx: Ctx, *, purpose: str, manifest_id, assets: list[dict], s
         table_node = _insert_node(cur, rid, aid, None, "TABLE", "TABLE", table_pred, "TABLE")
         policies = _policies(cur, aid)
         inv_entry = inventory.get(str(aid))
-        tables = {"huawei": {"db": asset["source_db"], "table": asset["source_table"]},
-                  "aliyun": {"db": asset["target_db"], "table": asset["target_table"]}}
+        cur.execute("SELECT * FROM dq_cluster_pair WHERE id=%s AND enabled", (asset["pair_id"],))
+        pair = cur.fetchone()
+        if pair is None:
+            raise ApiError(422, "CLUSTER_PAIR_DISABLED", f"cluster pair {asset['pair_id']} is unavailable")
+        tables = {
+            pair["source_cluster_id"]: {"db": asset["source_db"], "table": asset["source_table"]},
+            pair["target_cluster_id"]: {"db": asset["target_db"], "table": asset["target_table"]},
+        }
         for e in entries:
             pred = list(e["predicate"])
             node = _insert_node(cur, rid, aid, table_node, "PARTITION", e["scope_key"], pred, e["label"], e["id"])
@@ -435,7 +455,9 @@ def build_run(cur, ctx: Ctx, *, purpose: str, manifest_id, assets: list[dict], s
                                                     contract_issue=issue, transfer_ok=ok)
                 prio = policy["priority"] if policy["priority"] is not None else asset["priority"]
                 evidence = d.get("evidence", "CONTENT_HASH") if kind == "DEEP" else kind
-                xs = {"tables": tables, "columns": cols, "transfer_class": tc, "transfer_approval_ref": approval_ref,
+                xs = {"pair_id": asset["pair_id"], "source_cluster_id": pair["source_cluster_id"],
+                      "target_cluster_id": pair["target_cluster_id"], "tables": tables, "columns": cols,
+                      "transfer_class": tc, "transfer_approval_ref": approval_ref,
                       "detail_approval_ref": detail_approval_ref, "policy_priority": policy["priority"],
                       "policy_control_state": policy["control_state"], "policy_ids": policy["policy_ids"],
                       "limits": spec_limits(cfg, kind, d), "result_cap": str(rule_cap(rs)),
@@ -514,13 +536,13 @@ def member_context(obs_digest: bytes, node_id: str) -> dict:
     return {"schema": "SRDQ-OBS-2-MEMBER", "observation": obs_digest.hex(), "node_id": node_id}
 
 
-def build_spec(rc: dict, side: str, members: list[dict]) -> dict:
+def build_spec(rc: dict, cluster_id: str, members: list[dict]) -> dict:
     rs, xs = rc["rule_snapshot"], rc["execution_snapshot"]
     kind = rc["check_kind"]
     d = rs["definition"]
-    spec: dict = {"kind": "CHECK", "check_kind": kind, "side": side, "table": xs["tables"][side],
-                  "columns": xs["columns"], "limits": xs["limits"], "rule_digest_hex": bytes(rc["rule_digest"]).hex(),
-                  "members": members}
+    spec: dict = {"kind": "CHECK", "check_kind": kind, "cluster_id": cluster_id,
+                  "table": xs["tables"][cluster_id], "columns": xs["columns"], "limits": xs["limits"],
+                  "rule_digest_hex": bytes(rc["rule_digest"]).hex(), "members": members}
     if kind == "METRIC":
         spec["rule"] = {"group_by": d.get("group_by") or [], "filter": d.get("filter") or {"op": "TRUE"},
                         "metrics": [{k: m.get(k) for k in ("id", "function", "column", "value_type", "scale")}
@@ -615,11 +637,13 @@ def create_observation(cur, rc: dict, gen) -> Any:
     for uid, ms in units.items():
         spec_members = [{k: m[k] for k in ("node_id", "predicate", "context_digest_hex", "bucket") if k in m}
                         for m in ms]
-        for side in SIDES:
-            cur.execute("""INSERT INTO dq_work_item (id, run_id, asset_id, run_check_id, observation_id, side, kind,
-                           check_kind, scan_unit_id, spec) VALUES (%s,%s,%s,%s,%s,%s,'CHECK',%s,%s,%s)""",
-                        (new_id(), rc["run_id"], rc["asset_id"], rc["id"], oid, side, kind, uid,
-                         jb(build_spec(rc, side, spec_members))))
+        xs = rc["execution_snapshot"]
+        for cluster_id in (xs["source_cluster_id"], xs["target_cluster_id"]):
+            cur.execute("""INSERT INTO dq_work_item (id, run_id, asset_id, run_check_id, observation_id, cluster_id,
+                           kind, check_kind, scan_unit_id, spec)
+                           VALUES (%s,%s,%s,%s,%s,%s,'CHECK',%s,%s,%s)""",
+                        (new_id(), rc["run_id"], rc["asset_id"], rc["id"], oid, cluster_id, kind, uid,
+                         jb(build_spec(rc, cluster_id, spec_members))))
     cur.execute("""UPDATE dq_run_check SET observation_seq=%s, current_observation_id=%s, revision=revision+1,
                    updated_at=now() WHERE id=%s""", (seq, oid, rc["id"]))
     return oid

@@ -10,7 +10,7 @@
     {% if c.unknown_periods %}未知时间段 {{ c.unknown_periods|length }} 个。{% endif %}</div>
   {% endif %}
   {% for a in crit %}
-  <div class="alert critical">[{{ a.kind }}{% if a.side %} · {{ a.side }}{% endif %}] {{ a.message }}
+  <div class="alert critical">[{{ a.kind }}{% if a.cluster_id %} · {{ a.cluster_id }}{% endif %}] {{ a.message }}
     <span class="muted">（{{ a.occurrences }} 次，最近 {{ ts(a.last_seen) }}）</span></div>
   {% endfor %}
   {% if d.storage_suspect %}
@@ -45,23 +45,23 @@
   </div>
 
   <div class="card">
-    <h2>集群负载</h2>
+    <h2>集群队列与吞吐（近 1 小时）</h2>
     <table class="compact">
-      <tr><th>集群</th><th>状态</th><th>并发</th><th>在途</th><th>未确认取消</th><th>触发</th><th>操作</th></tr>
-      {% for side, s in d.clusters.items() %}
+      <tr><th>集群</th><th>类型</th><th>状态</th><th>在途/上限</th><th>READY</th><th>最老队龄</th><th>完成/小时</th><th>平均/P50/P95/最大 ms</th><th>成功/超时</th><th>ETA</th></tr>
+      {% for cluster_id, cluster in d.clusters.items() %}
+      {% for kind, pool in cluster.pools.items() %}
       <tr>
-        <td>{{ side }}</td>
-        <td>{% if s.hard_stop %}<span class="badge b-hard_stop">硬熔断</span>{% elif s.triggers %}<span class="badge b-degraded">降并发</span>{% else %}<span class="badge b-ok">正常</span>{% endif %}</td>
-        <td>{{ s.concurrency if s.concurrency is not none else "默认" }}</td>
-        <td>{{ s.running }}</td>
-        <td class="{{ 'warn' if s.cancel_unconfirmed else '' }}">{{ s.cancel_unconfirmed }}</td>
-        <td>{{ s.triggers|join(", ") or "—" }}</td>
-        <td>{% if s.hard_stop %}
-          <form method="post" action="/actions/operations/preview" class="inline">
-            <input type="hidden" name="op" value="RESUME_CLUSTER"><input type="hidden" name="target_type" value="CLUSTER">
-            <input type="hidden" name="target_ids" value="{{ side }}"><button type="submit">恢复（预览）</button>
-          </form>{% endif %}</td>
+        <td>{{ cluster.name }}<br><span class="muted">{{ cluster_id }}</span></td><td>{{ kind }}</td>
+        <td>{% if cluster.triggers %}<span class="badge b-degraded">告警</span>{% else %}<span class="badge b-ok">正常</span>{% endif %}</td>
+        <td>{{ pool.live }}/{{ pool.limit }}</td><td>{{ pool.ready }}</td>
+        <td>{% if pool.oldest_ready_age_seconds is not none %}{{ (pool.oldest_ready_age_seconds / 3600)|round(1) }} 小时{% else %}—{% endif %}</td>
+        <td>{{ pool.completed_last_hour }}</td>
+        <td>{{ pool.avg_ms if pool.avg_ms is not none else "—" }}/{{ pool.p50_ms if pool.p50_ms is not none else "—" }}/{{ pool.p95_ms if pool.p95_ms is not none else "—" }}/{{ pool.max_ms if pool.max_ms is not none else "—" }}</td>
+        <td>{% if pool.success_rate is not none %}{{ (pool.success_rate * 100)|round(1) }}% / {{ (pool.timeout_rate * 100)|round(1) }}%{% else %}—{% endif %}</td>
+        <td>{% if pool.eta_hours is not none %}{{ pool.eta_hours }} 小时{% else %}不可估算{% endif %}</td>
       </tr>
+      {% endfor %}
+      {% if cluster.cancel_unconfirmed %}<tr><td colspan="10" class="warn">{{ cluster_id }} 有 {{ cluster.cancel_unconfirmed }} 个取消尚未确认</td></tr>{% endif %}
       {% endfor %}
     </table>
   </div>
@@ -104,7 +104,7 @@
   <table>
     <tr><th>级别</th><th>类型</th><th>集群</th><th>内容</th><th>次数</th><th>最近</th></tr>
     {% for a in d.alerts %}
-    <tr><td>{{ m.badge(a.severity) }}</td><td>{{ a.kind }}</td><td>{{ a.side or "—" }}</td><td>{{ a.message }}</td>
+    <tr><td>{{ m.badge(a.severity) }}</td><td>{{ a.kind }}</td><td>{{ a.cluster_id or "—" }}</td><td>{{ a.message }}</td>
       <td>{{ a.occurrences }}</td><td>{{ ts(a.last_seen) }}</td></tr>
     {% endfor %}
   </table>
@@ -114,9 +114,9 @@
 <section>
   <h2>执行器</h2>
   <table>
-    <tr><th>名称</th><th>逻辑 side</th><th>物理位置</th><th>状态</th><th>最近心跳</th><th>SR 版本</th><th>S1</th></tr>
+    <tr><th>名称</th><th>物理集群</th><th>物理位置</th><th>状态</th><th>最近心跳</th><th>SR 版本</th><th>S1</th></tr>
     {% for w in d.workers %}
-    <tr><td>{{ w.name }}</td><td>{{ w.side }}</td><td>{{ w.execution_location }}</td>
+    <tr><td>{{ w.name }}</td><td>{{ w.cluster_id }}</td><td>{{ w.execution_location }}</td>
       <td>{{ m.badge(w.registration_status or w.status) }}</td><td>{{ ts(w.last_heartbeat_at) }}</td>
       <td>{{ w.sr_version or "—" }}</td><td>{{ w.s1_status or "—" }}</td></tr>
     {% else %}<tr><td colspan="7" class="muted">尚未创建执行器凭证（srdq worker-token create）</td></tr>{% endfor %}

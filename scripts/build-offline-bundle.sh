@@ -5,8 +5,6 @@ umask 0022
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OUT_DIR="$ROOT/dist"
 PROVISION_DIR=
-HUAWEI_WORKER_NAME=hw-1
-ALIYUN_WORKER_NAME=al-1
 PYTHON_VERSION=3.11
 PLATFORM=manylinux2014_x86_64
 PIP_VERSION=${PIP_VERSION:-24.0}
@@ -16,9 +14,8 @@ UV=${UV:-$(command -v uv || true)}
 usage() {
   cat <<'EOF'
 usage: build-offline-bundle.sh --provision-dir DIR [--out-dir DIR]
-                               [--huawei-worker-name NAME] [--aliyun-worker-name NAME]
 
-DIR must contain config.yaml and secrets/huawei.json + secrets/aliyun.json.
+DIR must contain config.yaml and one secrets/<cluster-id>.json per configured physical cluster.
 The config must have run_enabled: true. Worker tokens are generated during installation.
 EOF
 }
@@ -27,8 +24,6 @@ while (($#)); do
   case "$1" in
     --provision-dir) shift; PROVISION_DIR=${1:?--provision-dir needs a directory} ;;
     --out-dir) shift; OUT_DIR=${1:?--out-dir needs a directory} ;;
-    --huawei-worker-name) shift; HUAWEI_WORKER_NAME=${1:?worker name is required} ;;
-    --aliyun-worker-name) shift; ALIYUN_WORKER_NAME=${1:?worker name is required} ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -37,15 +32,13 @@ done
 
 [[ -n "$PROVISION_DIR" ]] || { usage >&2; exit 2; }
 PROVISION_DIR=$(cd "$PROVISION_DIR" && pwd)
-[[ $HUAWEI_WORKER_NAME =~ ^[0-9A-Za-z._-]{1,64}$ ]] || { echo "invalid Huawei worker name" >&2; exit 1; }
-[[ $ALIYUN_WORKER_NAME =~ ^[0-9A-Za-z._-]{1,64}$ ]] || { echo "invalid Aliyun worker name" >&2; exit 1; }
 [[ $(uname -m) == x86_64 ]] || { echo "build host must be x86_64" >&2; exit 1; }
 [[ -n "$UV" ]] || { echo "uv is required" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 command -v unzip >/dev/null || { echo "unzip is required" >&2; exit 1; }
-for file in "$PROVISION_DIR/config.yaml" "$PROVISION_DIR/secrets/huawei.json" "$PROVISION_DIR/secrets/aliyun.json"; do
-  [[ -f "$file" && ! -L "$file" ]] || { echo "missing regular provision file: $file" >&2; exit 1; }
-done
+[[ -f "$PROVISION_DIR/config.yaml" && ! -L "$PROVISION_DIR/config.yaml" ]] || {
+  echo "missing regular provision config: $PROVISION_DIR/config.yaml" >&2; exit 1;
+}
 if find "$PROVISION_DIR" -type l -print -quit | grep -q .; then
   echo "provision directory must not contain symbolic links" >&2
   exit 1
@@ -67,12 +60,19 @@ if cfg["run_enabled"] is not True:
     raise SystemExit("provision config must set run_enabled: true")
 if not cfg.transfer_approved:
     raise SystemExit("provision config must set a non-placeholder transfer.global_approval_ref")
-for side, user in (("huawei", "srdq-hw"), ("aliyun", "srdq-al")):
-    expected = f"/etc/srdq/secrets/{side}.json"
-    entry = cfg["credentials"][side]
-    if entry["file"] != expected or entry["os_user"] != user or entry["mode"] != "0600":
-        raise SystemExit(f"credentials.{side} must use file={expected}, os_user={user}, mode=0600")
-    path = root / "secrets" / f"{side}.json"
+users = {
+    "huawei-1": "srdq-hw1", "aliyun-1": "srdq-al1",
+    "huawei-2": "srdq-hw2", "aliyun-2": "srdq-al2",
+    "huawei-3": "srdq-hw3", "aliyun-3": "srdq-al3",
+}
+if set(cfg.cluster_ids) != set(users):
+    raise SystemExit(f"production config must define exactly these clusters: {sorted(users)}")
+for cluster in cfg["physical_clusters"]:
+    cluster_id = cluster["id"]
+    expected = f"/etc/srdq/secrets/{cluster_id}.json"
+    if cluster["credential_file"] != expected or cluster["os_user"] != users[cluster_id]:
+        raise SystemExit(f"physical cluster {cluster_id} must use credential_file={expected}, os_user={users[cluster_id]}")
+    path = root / "secrets" / f"{cluster_id}.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -137,8 +137,6 @@ PYTHON_VERSION=$PYTHON_VERSION
 GLIBC_MIN=2.17
 PG_VERSION=$PG_VERSION
 PG_MAJOR=$PG_MAJOR
-HUAWEI_WORKER_NAME=$HUAWEI_WORKER_NAME
-ALIYUN_WORKER_NAME=$ALIYUN_WORKER_NAME
 EOF
 
 (

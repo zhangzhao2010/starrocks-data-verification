@@ -13,7 +13,10 @@ BACKUP_DIR=$DATA_ROOT/backups
 CONFIG_DIR=/etc/srdq
 CONFIG_FILE=$CONFIG_DIR/config.yaml
 PG_CREDENTIAL=$CONFIG_DIR/secrets/pg.json
-APP_SERVICES=(srdq-controller.service srdq-web.service srdq-executor@huawei.service srdq-executor@aliyun.service)
+CLUSTER_IDS=(huawei-1 aliyun-1 huawei-2 aliyun-2 huawei-3 aliyun-3)
+declare -A CLUSTER_USERS=([huawei-1]=srdq-hw1 [aliyun-1]=srdq-al1 [huawei-2]=srdq-hw2 [aliyun-2]=srdq-al2 [huawei-3]=srdq-hw3 [aliyun-3]=srdq-al3)
+APP_SERVICES=(srdq-controller.service srdq-web.service)
+for cluster_id in "${CLUSTER_IDS[@]}"; do APP_SERVICES+=("srdq-executor@${cluster_id}.service"); done
 
 die() { printf 'srdq deploy: %s\n' "$*" >&2; exit 1; }
 
@@ -38,8 +41,6 @@ load_bundle() {
   GLIBC_MIN=$(bundle_value GLIBC_MIN)
   PG_VERSION=$(bundle_value PG_VERSION)
   PG_MAJOR=$(bundle_value PG_MAJOR)
-  HUAWEI_WORKER_NAME=$(bundle_value HUAWEI_WORKER_NAME)
-  ALIYUN_WORKER_NAME=$(bundle_value ALIYUN_WORKER_NAME)
 }
 
 find_python() {
@@ -85,7 +86,9 @@ ensure_accounts_and_dirs() {
   ensure_group srdq
   ensure_group srdq-pg
   ensure_user srdq-pg srdq-pg
-  for user in srdq-ctl srdq-hw srdq-al; do ensure_user "$user" srdq; done
+  ensure_user srdq-ctl srdq
+  local cluster_id user
+  for cluster_id in "${CLUSTER_IDS[@]}"; do ensure_user "${CLUSTER_USERS[$cluster_id]}" srdq; done
   usermod -a -G srdq-pg srdq-ctl
 
   install -d -o root -g root -m 0755 "$SRDQ_ROOT" "$RELEASES_DIR" "$PG_ROOT" "$SRDQ_ROOT/bin"
@@ -94,8 +97,10 @@ ensure_accounts_and_dirs() {
   install -d -o srdq-pg -g srdq-pg -m 0700 "$PG_DATA" "$BACKUP_DIR"
   install -d -o srdq-ctl -g srdq -m 0700 "$DATA_ROOT/controller" "$DATA_ROOT/reports"
   install -d -o root -g root -m 0755 "$DATA_ROOT/executor"
-  install -d -o srdq-hw -g srdq -m 0700 "$DATA_ROOT/executor/huawei"
-  install -d -o srdq-al -g srdq -m 0700 "$DATA_ROOT/executor/aliyun"
+  for cluster_id in "${CLUSTER_IDS[@]}"; do
+    user=${CLUSTER_USERS[$cluster_id]}
+    install -d -o "$user" -g srdq -m 0700 "$DATA_ROOT/executor/$cluster_id"
+  done
 }
 
 atomic_symlink() {
@@ -191,19 +196,21 @@ EOF
 }
 
 install_provisioned_config() {
-  local packaged="$BUNDLE_ROOT/provision" source base side user destination old_token
-  [[ -f "$packaged/config.yaml" && -f "$packaged/secrets/huawei.json" && \
-     -f "$packaged/secrets/aliyun.json" ]] || die "bundle has no production provision files"
+  local packaged="$BUNDLE_ROOT/provision" source base cluster_id user destination old_token
+  [[ -f "$packaged/config.yaml" ]] || die "bundle has no production config"
+  for cluster_id in "${CLUSTER_IDS[@]}"; do
+    [[ -f "$packaged/secrets/$cluster_id.json" ]] || die "bundle has no secret for $cluster_id"
+  done
   install -o root -g srdq -m 0640 "$packaged/config.yaml" "$CONFIG_FILE"
   while IFS= read -r -d '' source; do
     base=$(basename "$source")
-    [[ "$base" == huawei.json || "$base" == aliyun.json ]] && continue
+    [[ "$base" =~ ^(huawei|aliyun)-[123]\.json$ ]] && continue
     install -o root -g srdq -m 0640 "$source" "$CONFIG_DIR/secrets/$base"
   done < <(find "$packaged/secrets" -maxdepth 1 -type f -print0)
 
-  for side in huawei aliyun; do
-    [[ "$side" == huawei ]] && user=srdq-hw || user=srdq-al
-    destination="$CONFIG_DIR/secrets/$side.json"
+  for cluster_id in "${CLUSTER_IDS[@]}"; do
+    user=${CLUSTER_USERS[$cluster_id]}
+    destination="$CONFIG_DIR/secrets/$cluster_id.json"
     old_token=
     if [[ -f "$destination" ]]; then
       old_token=$("$PYTHON_BIN" - "$destination" <<'PY'
@@ -215,7 +222,7 @@ except (OSError, ValueError):
 PY
 )
     fi
-    "$PYTHON_BIN" - "$packaged/secrets/$side.json" "$destination" "$old_token" "$user" <<'PY'
+    "$PYTHON_BIN" - "$packaged/secrets/$cluster_id.json" "$destination" "$old_token" "$user" <<'PY'
 import grp, json, os, pwd, sys, tempfile
 source, destination, token, user = sys.argv[1:]
 data = json.load(open(source, encoding="utf-8"))
@@ -266,18 +273,17 @@ snapshot_installed_config() {
 }
 
 restore_release_config() {
-  local release=$1 snapshot="$1/config-snapshot" source base owner
-  [[ -f "$snapshot/config.yaml" && -f "$snapshot/secrets/huawei.json" && \
-     -f "$snapshot/secrets/aliyun.json" && -f "$snapshot/secrets/pg.json" ]] || return 1
+  local release=$1 snapshot="$1/config-snapshot" source base owner cluster_id
+  [[ -f "$snapshot/config.yaml" && -f "$snapshot/secrets/pg.json" ]] || return 1
+  for cluster_id in "${CLUSTER_IDS[@]}"; do [[ -f "$snapshot/secrets/$cluster_id.json" ]] || return 1; done
   install -o root -g srdq -m 0640 "$snapshot/config.yaml" "$CONFIG_FILE"
   while IFS= read -r -d '' source; do
     base=$(basename "$source")
-    case "$base" in
-      huawei.json) owner=srdq-hw ;;
-      aliyun.json) owner=srdq-al ;;
-      pg.json) owner=srdq-ctl ;;
-      *) owner=root ;;
-    esac
+    owner=root
+    [[ "$base" == pg.json ]] && owner=srdq-ctl
+    for cluster_id in "${CLUSTER_IDS[@]}"; do
+      [[ "$base" == "$cluster_id.json" ]] && owner=${CLUSTER_USERS[$cluster_id]}
+    done
     if [[ "$owner" == root ]]; then
       install -o root -g srdq -m 0640 "$source" "$CONFIG_DIR/secrets/$base"
     else
@@ -287,17 +293,12 @@ restore_release_config() {
 }
 
 issue_worker_tokens() {
-  local release=$1 side name user token_file credential
-  for side in huawei aliyun; do
-    if [[ "$side" == huawei ]]; then
-      name=$HUAWEI_WORKER_NAME
-      user=srdq-hw
-    else
-      name=$ALIYUN_WORKER_NAME
-      user=srdq-al
-    fi
-    token_file="$DATA_ROOT/controller/.worker-token-${side}.$$"
-    credential="$CONFIG_DIR/secrets/$side.json"
+  local release=$1 cluster_id name user token_file credential
+  for cluster_id in "${CLUSTER_IDS[@]}"; do
+    name="worker-$cluster_id"
+    user=${CLUSTER_USERS[$cluster_id]}
+    token_file="$DATA_ROOT/controller/.worker-token-${cluster_id}.$$"
+    credential="$CONFIG_DIR/secrets/$cluster_id.json"
     if "$PYTHON_BIN" - "$credential" <<'PY'
 import json, sys
 token = json.load(open(sys.argv[1], encoding="utf-8")).get("worker_token")
@@ -308,7 +309,7 @@ PY
     fi
     rm -f "$token_file"
     if ! runuser -u srdq-ctl -- env SRDQ_CONFIG="$CONFIG_FILE" "$release/venv/bin/srdq" \
-        worker-token create --name "$name" --side "$side" --rotate --out "$token_file" >/dev/null; then
+        worker-token create --name "$name" --cluster-id "$cluster_id" --rotate --out "$token_file" >/dev/null; then
       rm -f "$token_file"
       return 1
     fi

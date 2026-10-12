@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from ..db.db import jb, new_id
 from . import differences
-from .common import KIND_RANK, LAYER_RANK, SIDES, ApiError, Ctx, as_uuid, audit, control, iso, lock_control
+from .common import KIND_RANK, LAYER_RANK, ApiError, Ctx, as_uuid, audit, control, iso, lock_control
 
 FILES = ("report.md", "progress.csv", "differences.csv", "incomplete.csv", "load.csv")
 KINDS = ("COUNT", "METRIC", "SAMPLE", "DEEP")
@@ -192,14 +192,14 @@ def collect(cur, ctx: Ctx, start: _dt.datetime, end: _dt.datetime, ctl: dict) ->
     _, data["chains"] = differences.chains(cur, as_of=end, resolved_since=start, limit=1_000_000)
     data["incomplete"] = _incomplete(cur, run_ids, iv)
     data["storage_suspect"] = _storage_suspect(cur, iv)
-    data["load"] = _load(cur, iv)
+    data["load"] = _load(cur, ctx, iv)
     data["statements"] = _statements(cur, iv)
     data["unknown_periods"] = [p for p in (ctl["unknown_periods"] or [])
                                if (p.get("to") or "") >= iso(start) and (p.get("from") or "") <= iso(end)]
-    cur.execute("""SELECT a.id, a.side, a.status, a.cancel_reason, a.lease_expires_at, w.asset_id, w.check_kind,
-                          ast.source_db, ast.source_table, a.query_ref
+    cur.execute("""SELECT a.id, a.cluster_id, a.status, a.cancel_reason, a.lease_expires_at, w.asset_id,
+                          w.check_kind, ast.source_db, ast.source_table, a.query_ref
                    FROM dq_attempt a JOIN dq_work_item w ON w.id = a.work_item_id JOIN dq_asset ast ON ast.id = w.asset_id
-                   WHERE a.status IN ('CANCEL_REQUESTED','CANCEL_PENDING') ORDER BY a.side, a.claimed_at""")
+                   WHERE a.status IN ('CANCEL_REQUESTED','CANCEL_PENDING') ORDER BY a.cluster_id, a.claimed_at""")
     data["unconfirmed_cancels"] = cur.fetchall()
     counts: dict = {}
     for ch in data["chains"]:
@@ -233,7 +233,7 @@ def _incomplete(cur, run_ids: list, iv: dict) -> list[dict]:
         out.append({"category": cat, "check_kind": r["check_kind"], "layer": r["layer"],
                     "table": f"{r['source_db']}.{r['source_table']}", "scope": r["label"] or r["scope_key"],
                     "rule": f"{r['rule_key']}@{r['rule_revision']}", "reason": reason,
-                    "side": err.get("side") or "", "error_code": err.get("error_code") or "",
+                    "cluster_id": err.get("cluster_id") or "", "error_code": err.get("error_code") or "",
                     "run_id": str(r["run_id"])})
     cur.execute("""SELECT o.abandon_reason, o.check_kind, a.layer, a.source_db, a.source_table,
                           rc.scope_key, rc.rule_key, rc.rule_revision, rc.execution_snapshot->>'scope_label' AS label,
@@ -246,50 +246,55 @@ def _incomplete(cur, run_ids: list, iv: dict) -> list[dict]:
         out.append({"category": "ABANDONED", "check_kind": r["check_kind"], "layer": r["layer"],
                     "table": f"{r['source_db']}.{r['source_table']}", "scope": r["label"] or r["scope_key"],
                     "rule": f"{r['rule_key']}@{r['rule_revision']}", "reason": r["abandon_reason"] or "",
-                    "side": "", "error_code": "", "run_id": str(r["run_id"])})
+                    "cluster_id": "", "error_code": "", "run_id": str(r["run_id"])})
     return out
 
 
 def _storage_suspect(cur, iv: dict) -> list[dict]:
-    cur.execute("""SELECT a.side, ast.source_db, ast.source_table, ast.target_db, ast.target_table,
+    cur.execute("""SELECT a.cluster_id, p.source_cluster_id, ast.source_db, ast.source_table,
+                          ast.target_db, ast.target_table,
                           COALESCE(rc.execution_snapshot->>'scope_label', rc.scope_key, '') AS scope,
                           COALESCE(a.error_code, '') AS error_code, min(a.finished_at) AS first_seen,
                           max(a.finished_at) AS last_seen, count(*) AS n
                    FROM dq_attempt a JOIN dq_work_item w ON w.id = a.work_item_id
-                   JOIN dq_asset ast ON ast.id = w.asset_id LEFT JOIN dq_run_check rc ON rc.id = w.run_check_id
+                   JOIN dq_asset ast ON ast.id = w.asset_id JOIN dq_cluster_pair p ON p.id=ast.pair_id
+                   LEFT JOIN dq_run_check rc ON rc.id = w.run_check_id
                    WHERE a.error_class='STORAGE_SUSPECT' AND a.finished_at > %(s)s AND a.finished_at <= %(e)s
-                   GROUP BY 1, 2, 3, 4, 5, 6, 7 ORDER BY 1, 2, 3, 6""", iv)
+                   GROUP BY 1, 2, 3, 4, 5, 6, 7, 8 ORDER BY 1, 3, 4, 7""", iv)
     return cur.fetchall()
 
 
-def _load(cur, iv: dict) -> dict:
-    cur.execute("""SELECT event_type, object_id AS side, payload, created_at FROM dq_outbox
+def _load(cur, ctx: Ctx, iv: dict) -> dict:
+    cur.execute("""SELECT event_type, object_id AS cluster_id, payload, created_at FROM dq_outbox
                    WHERE event_type = ANY(%(ev)s) AND created_at > %(s)s AND created_at <= %(e)s
                    ORDER BY created_at""", dict(iv, ev=list(LOAD_EVENTS)))
     events = cur.fetchall()
-    cur.execute("""SELECT a.side, w.check_kind, count(*) AS n,
+    cur.execute("""SELECT a.cluster_id,
+                          CASE WHEN w.kind='METADATA' THEN 'METADATA' ELSE w.check_kind END AS claim_kind,
+                          count(*) AS n,
                           percentile_cont(0.5) WITHIN GROUP (ORDER BY a.duration_ms) AS p50,
                           percentile_cont(0.95) WITHIN GROUP (ORDER BY a.duration_ms) AS p95,
                           max(a.duration_ms) AS mx,
                           count(*) FILTER (WHERE a.error_class='TIMEOUT') AS timeouts
                    FROM dq_attempt a JOIN dq_work_item w ON w.id = a.work_item_id
-                   WHERE w.kind='CHECK' AND a.duration_ms IS NOT NULL AND a.finished_at > %(s)s
-                     AND a.finished_at <= %(e)s
-                   GROUP BY ROLLUP (1, 2) HAVING a.side IS NOT NULL ORDER BY 1, 2 NULLS FIRST""", iv)
+                   WHERE a.duration_ms IS NOT NULL AND a.finished_at > %(s)s AND a.finished_at <= %(e)s
+                   GROUP BY ROLLUP (1, 2) HAVING a.cluster_id IS NOT NULL ORDER BY 1, 2 NULLS FIRST""", iv)
     durations = cur.fetchall()
-    cur.execute("""SELECT side, count(*) AS n FROM dq_attempt
+    cur.execute("""SELECT cluster_id, count(*) AS n FROM dq_attempt
                    WHERE cancel_reason='WINDOW_CLOSED' AND claimed_at <= %(e)s
                      AND (finished_at IS NULL OR finished_at > %(s)s) GROUP BY 1""", iv)
-    deadline = {r["side"]: r["n"] for r in cur.fetchall()}
-    per_side = {}
-    for side in SIDES:
-        ev = [e for e in events if e["side"] == side]
-        per_side[side] = {"degrade": sum(e["event_type"] == "LOAD_DEGRADE" for e in ev),
-                          "recover": sum(e["event_type"] == "LOAD_RECOVER" for e in ev),
-                          "hard_stop": sum(e["event_type"] == "CLUSTER_HARD_STOP" for e in ev),
-                          "resumed": sum(e["event_type"] == "CLUSTER_RESUMED" for e in ev),
-                          "deadline_cancels": int(deadline.get(side, 0))}
-    return {"events": events, "durations": durations, "per_side": per_side}
+    deadline = {r["cluster_id"]: r["n"] for r in cur.fetchall()}
+    per_cluster = {}
+    for cluster_id in ctx.cfg.cluster_ids:
+        cluster_events = [e for e in events if e["cluster_id"] == cluster_id]
+        per_cluster[cluster_id] = {
+            "degrade": sum(e["event_type"] == "LOAD_DEGRADE" for e in cluster_events),
+            "recover": sum(e["event_type"] == "LOAD_RECOVER" for e in cluster_events),
+            "hard_stop": sum(e["event_type"] == "CLUSTER_HARD_STOP" for e in cluster_events),
+            "resumed": sum(e["event_type"] == "CLUSTER_RESUMED" for e in cluster_events),
+            "deadline_cancels": int(deadline.get(cluster_id, 0)),
+        }
+    return {"events": events, "durations": durations, "per_cluster": per_cluster}
 
 
 def _columns(kind: str, d: dict) -> str:
@@ -371,6 +376,12 @@ def _local(ctx: Ctx, t: Any) -> str:
     return t.astimezone(ZoneInfo(ctx.cfg["execution_window"]["timezone"])).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _storage_table(row: dict) -> str:
+    if row["cluster_id"] == row["source_cluster_id"]:
+        return f"{row['source_db']}.{row['source_table']}"
+    return f"{row['target_db']}.{row['target_table']}"
+
+
 def _write(ctx: Ctx, out_dir: Path, meta: dict, d: dict) -> dict[str, tuple[bytes, int, int]]:
     top = int(ctx.cfg["report"]["top_n_in_markdown"])
     formats = ctx.cfg["report"]["formats"]
@@ -398,24 +409,24 @@ def _write(ctx: Ctx, out_dir: Path, meta: dict, d: dict) -> dict[str, tuple[byte
                                           c["difference_count"], c["difference_count_mode"], c["summary"],
                                           c["comparison_id"]] for c in chains_sorted])
         files["incomplete.csv"] = _csv(out_dir / "incomplete.csv",
-                                       ["category", "check_kind", "layer", "table", "scope", "rule", "reason", "side",
-                                        "error_code", "run_id"],
+                                       ["category", "check_kind", "layer", "table", "scope", "rule", "reason",
+                                        "cluster_id", "error_code", "run_id"],
                                        [[x[k] for k in ("category", "check_kind", "layer", "table", "scope", "rule",
-                                                        "reason", "side", "error_code", "run_id")]
+                                                        "reason", "cluster_id", "error_code", "run_id")]
                                         for x in d["incomplete"]]
-                                       + [["STORAGE_SUSPECT_ATTEMPTS", "", "", f"{s['source_db']}.{s['source_table']}",
-                                           s["scope"], "", f"count={s['n']}; first={iso(s['first_seen'])}; "
-                                           f"last={iso(s['last_seen'])}", s["side"], s["error_code"], ""]
+                                       + [["STORAGE_SUSPECT_ATTEMPTS", "", "", _storage_table(s), s["scope"], "",
+                                           f"count={s['n']}; first={iso(s['first_seen'])}; "
+                                           f"last={iso(s['last_seen'])}", s["cluster_id"], s["error_code"], ""]
                                           for s in d["storage_suspect"]])
-        load_rows = [["event", e["side"], e["event_type"], iso(e["created_at"]), _event_text(e), "", "", "", ""]
+        load_rows = [["event", e["cluster_id"], e["event_type"], iso(e["created_at"]), _event_text(e), "", "", "", ""]
                      for e in d["load"]["events"]]
-        load_rows += [["duration", r["side"], r["check_kind"] or "ALL", "", "", r["n"], _ms(r["p50"]), _ms(r["p95"]),
-                       _ms(r["mx"])] for r in d["load"]["durations"]]
-        load_rows += [["unconfirmed_cancel", a["side"], a["status"], iso(a["lease_expires_at"]),
+        load_rows += [["duration", r["cluster_id"], r["claim_kind"] or "ALL", "", "", r["n"], _ms(r["p50"]),
+                       _ms(r["p95"]), _ms(r["mx"])] for r in d["load"]["durations"]]
+        load_rows += [["unconfirmed_cancel", a["cluster_id"], a["status"], iso(a["lease_expires_at"]),
                        f"{a['source_db']}.{a['source_table']} {a['check_kind'] or 'METADATA'} {a['cancel_reason']}",
                        "", "", "", ""] for a in d["unconfirmed_cancels"]]
-        files["load.csv"] = _csv(out_dir / "load.csv", ["type", "side", "name", "at", "detail", "queries", "p50_ms",
-                                                         "p95_ms", "max_ms"], load_rows)
+        files["load.csv"] = _csv(out_dir / "load.csv", ["type", "cluster_id", "name", "at", "detail", "queries",
+                                                         "p50_ms", "p95_ms", "max_ms"], load_rows)
     if "MARKDOWN" in formats:
         text = "\n".join(_markdown(ctx, meta, d, chains_sorted, top)) + "\n"
         data = text.encode("utf-8")
@@ -516,30 +527,32 @@ def _markdown(ctx: Ctx, meta: dict, d: dict, chains: list[dict], top: int) -> li
         L.append(f"\n共 {len(inc)} 条，此处列出前 {top} 条，完整内容见 incomplete.csv。")
     L += ["", "### 疑似存储类错误（STORAGE_SUSPECT）", "",
           "查询返回了疑似存储类错误，需转运维线下确认；这不是“数据已损坏”的结论，没有此类错误也不说明存储健康。", ""]
-    L += _table(["side", "表", "范围", "错误码", "首次", "最近", "次数"],
-                [[s["side"], f"{s['source_db']}.{s['source_table']}" if s["side"] == "huawei"
-                  else f"{s['target_db']}.{s['target_table']}", s["scope"], s["error_code"],
+    L += _table(["集群", "表", "范围", "错误码", "首次", "最近", "次数"],
+                [[s["cluster_id"], _storage_table(s), s["scope"], s["error_code"],
                   _local(ctx, s["first_seen"]), _local(ctx, s["last_seen"]), s["n"]]
                  for s in d["storage_suspect"][:top]] or [["（无）", "", "", "", "", "", ""]])
-    L += ["", "## 4. 负载与熔断", ""]
-    ps = d["load"]["per_side"]
-    L += _table(["集群", "降并发", "恢复", "硬熔断", "人工恢复", "截止取消"],
-                [[s, ps[s]["degrade"], ps[s]["recover"], ps[s]["hard_stop"], ps[s]["resumed"],
-                  ps[s]["deadline_cancels"]] for s in SIDES])
+    L += ["", "## 4. 负载监控", ""]
+    ps = d["load"]["per_cluster"]
+    L += _table(["集群", "负载告警", "恢复事件", "历史硬熔断", "人工恢复", "截止取消"],
+                [[cluster_id, ps[cluster_id]["degrade"], ps[cluster_id]["recover"],
+                  ps[cluster_id]["hard_stop"], ps[cluster_id]["resumed"], ps[cluster_id]["deadline_cancels"]]
+                 for cluster_id in ctx.cfg.cluster_ids])
     if d["load"]["events"]:
         L += ["", "时间点：", ""]
         L += _table(["时间", "集群", "事件", "说明"],
-                    [[_local(ctx, e["created_at"]), e["side"], e["event_type"], _event_text(e)]
+                    [[_local(ctx, e["created_at"]), e["cluster_id"], e["event_type"], _event_text(e)]
                      for e in d["load"]["events"][:top]])
     L += ["", "查询耗时（毫秒）：", ""]
     L += _table(["集群", "类型", "查询数", "P50", "P95", "最大", "超时"],
-                [[r["side"], r["check_kind"] or "全部", r["n"], _ms(r["p50"]), _ms(r["p95"]), _ms(r["mx"]),
-                  r["timeouts"]] for r in d["load"]["durations"]] or [["（无）", "", "", "", "", "", ""]])
+                [[r["cluster_id"], r["claim_kind"] or "全部", r["n"], _ms(r["p50"]), _ms(r["p95"]),
+                  _ms(r["mx"]), r["timeouts"]] for r in d["load"]["durations"]]
+                or [["（无）", "", "", "", "", "", ""]])
     if d["unconfirmed_cancels"]:
         L += ["", "未确认终止的查询：", ""]
         L += _table(["集群", "状态", "表", "类型", "取消原因"],
-                    [[a["side"], a["status"], f"{a['source_db']}.{a['source_table']}", a["check_kind"] or "METADATA",
-                      a["cancel_reason"]] for a in d["unconfirmed_cancels"][:top]])
+                    [[a["cluster_id"], a["status"], f"{a['source_db']}.{a['source_table']}",
+                      a["check_kind"] or "METADATA", a["cancel_reason"]]
+                     for a in d["unconfirmed_cancels"][:top]])
     L += ["", "## 5. 声明", ""]
     st = d["statements"]
     L += ["- 共同快照保证：无。两端在各自的在线状态下读取，读取时间不同；差异可能来自在线写入时差。",

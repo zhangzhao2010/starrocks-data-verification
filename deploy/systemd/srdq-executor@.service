@@ -1,14 +1,13 @@
-# Template unit: srdq-executor@huawei.service runs as srdq-hw, srdq-executor@aliyun.service as srdq-al.
-# The per-side user is set by the drop-ins in srdq-executor@huawei.service.d/ and srdq-executor@aliyun.service.d/.
+# Each configured cluster has a drop-in that selects its isolated OS user and hides all other credentials.
 [Unit]
-Description=srdq %i executor (read-only StarRocks queries for side %i)
+Description=srdq %i executor (read-only StarRocks queries for cluster %i)
 After=network-online.target srdq-controller.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 Environment=SRDQ_CONFIG=/etc/srdq/config.yaml
-ExecStart=/opt/srdq/current/venv/bin/srdq executor --side %i
+ExecStart=/opt/srdq/current/venv/bin/srdq executor --cluster-id %i
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=90

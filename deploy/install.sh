@@ -20,10 +20,8 @@ migration_command "$RELEASES_DIR/$BUNDLE_VERSION"
 issue_worker_tokens "$RELEASES_DIR/$BUNDLE_VERSION"
 snapshot_installed_config "$RELEASES_DIR/$BUNDLE_VERSION"
 atomic_symlink "$RELEASES_DIR/$BUNDLE_VERSION" "$CURRENT_LINK"
-systemctl enable --now srdq-controller.service srdq-web.service srdq-executor@huawei.service \
-  srdq-executor@aliyun.service srdq-pg-backup.timer
-systemctl is-active --quiet srdq-controller.service srdq-web.service srdq-executor@huawei.service \
-  srdq-executor@aliyun.service
+systemctl enable --now "${APP_SERVICES[@]}" srdq-pg-backup.timer
+for service in "${APP_SERVICES[@]}"; do systemctl is-active --quiet "$service"; done
 
 cat <<EOF
 srdq $BUNDLE_VERSION installed with the packaged production configuration; all services are running.

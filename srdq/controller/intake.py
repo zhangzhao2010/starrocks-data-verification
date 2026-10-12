@@ -173,7 +173,10 @@ def _gate(cur, ctx: Ctx, worker: dict, aid, wid, lg: int, result_kind: str):
         raise ApiError(404, "UNKNOWN_ATTEMPT", "attempt not found for this worker")
     if a["lease_generation"] != lg or (wid is not None and a["work_item_id"] != wid):
         raise ApiError(409, "LEASE_MISMATCH", "lease generation or work item does not match the attempt")
-    cur.execute("SELECT * FROM dq_work_item WHERE id=%s FOR UPDATE", (a["work_item_id"],))
+    cur.execute("""SELECT w.*, rc.execution_snapshot
+                   FROM dq_work_item w
+                   LEFT JOIN dq_run_check rc ON rc.id=w.run_check_id
+                   WHERE w.id=%s FOR UPDATE OF w""", (a["work_item_id"],))
     w = cur.fetchone()
     if result_kind is not None and (w["kind"] == "METADATA") != (result_kind == "METADATA"):
         raise ApiError(422, "RESULT_KIND_MISMATCH", f"work item is {w['kind']}")
@@ -322,8 +325,12 @@ def _check_envelope(env: dict, w: dict, o: dict) -> list[dict]:
     for k in ("observation_id", "run_check_id", "scan_unit_id"):
         if str(env.get(k)) != str(w[k]):
             raise Reject("ENVELOPE_MISMATCH", f"{k} does not match the work item")
-    if env.get("side") != w["side"] or env.get("check_kind") != w["check_kind"]:
-        raise Reject("ENVELOPE_MISMATCH", "side or check_kind does not match the work item")
+    if env.get("cluster_id") != w["cluster_id"] or env.get("check_kind") != w["check_kind"]:
+        raise Reject("ENVELOPE_MISMATCH", "cluster_id or check_kind does not match the work item")
+    snapshot = w.get("execution_snapshot") or {}
+    pair_clusters = {snapshot.get("source_cluster_id"), snapshot.get("target_cluster_id")}
+    if w["cluster_id"] not in pair_clusters:
+        raise Reject("PAIR_MISMATCH", "work item cluster is outside the frozen cluster pair")
     if env.get("rule_id") is not None and str(env.get("rule_id")) != str(o["rule_id"]):
         raise Reject("ENVELOPE_MISMATCH", "rule_id does not match the observation")
     contract = o["contract"]
@@ -726,21 +733,21 @@ def _publish(cur, ctx: Ctx, ctl: dict, env: dict, edig: bytes, a: dict, w: dict,
         srid = new_id()
         key = f"{ctl['control_generation']}:{w['id']}:{a['id']}:{a['lease_generation']}:{v.node_id}:{kind}"
         cur.execute("""INSERT INTO dq_side_result (id, attempt_id, work_item_id, observation_id, run_check_id, node_id,
-                       side, check_kind, protocol_version, idempotency_key, envelope_digest, context_digest, evidence,
+                       cluster_id, check_kind, protocol_version, idempotency_key, envelope_digest, context_digest, evidence,
                        payload, result_complete, total_bytes, row_count, validity, read_started, read_finished,
                        query_ref, template_digest, accepted_at)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s,'ACCEPTED',%s,%s,%s,%s,now())""",
-                    (srid, a["id"], w["id"], w["observation_id"], w["run_check_id"], v.node_id, w["side"], kind,
+                    (srid, a["id"], w["id"], w["observation_id"], w["run_check_id"], v.node_id, w["cluster_id"], kind,
                      env["protocol_version"], key, edig, v.context_digest, v.evidence, jb(v.payload), v.total_bytes,
                      v.row_count, v.read_started, v.read_finished, None if qref is None else jb(qref), tmpl))
         if v.groups is not None:
             _insert_groups(cur, srid, v.groups)
         if v.chunk_dir is not None:
             scope = {"METRIC": "GROUPS", "SAMPLE": "SAMPLE", "DEEP": "FULL"}[kind]
-            cur.execute("""INSERT INTO dq_artifact (id, run_id, run_check_id, rule_id, side_result_id, side,
+            cur.execute("""INSERT INTO dq_artifact (id, run_id, run_check_id, rule_id, side_result_id, cluster_id,
                            material_scope, rel_path, projection_digest, content_digest, size_bytes, row_count,
                            transfer_class, accepted_at, purge_after, detail)
-                           SELECT %s, w.run_id, w.run_check_id, o.rule_id, %s, w.side, %s, %s, %s, %s, %s, %s, %s,
+                           SELECT %s, w.run_id, w.run_check_id, o.rule_id, %s, w.cluster_id, %s, %s, %s, %s, %s, %s, %s,
                                   now(), now() + make_interval(days => %s), %s
                            FROM dq_work_item w JOIN dq_observation o ON o.id = w.observation_id WHERE w.id=%s""",
                         (new_id(), srid, scope, str(srid), _hex32(v.payload.get("projection_digest")),
@@ -851,7 +858,8 @@ def report_failure(ctx: Ctx, worker: dict, body: dict) -> dict:
         if cls == "QUERY_ERROR" and _storage_suspect(ctx, msg):
             cls = "STORAGE_SUSPECT"
             incident(cur, "STORAGE_SUSPECT", f"{w['run_check_id'] or w['id']}",
-                     f"possible storage fault on {a['side']}: {msg[:300]}", side=a["side"], severity="CRITICAL",
+                     f"possible storage fault on {a['cluster_id']}: {msg[:300]}", cluster_id=a["cluster_id"],
+                     severity="CRITICAL",
                      run_id=w["run_id"], run_check_id=w["run_check_id"], asset_id=w["asset_id"],
                      check_kind=w["check_kind"], error_code=code)
         if a["status"] in CANCELLING and a["cancel_reason"] != "FAILED_UNCONFIRMED" and terminated:

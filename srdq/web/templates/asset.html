@@ -2,9 +2,10 @@
 {% import "macros.html" as m with context %}
 {% block content %}
 <dl class="kv">
+  <dt>校验组</dt><dd>{{ a.pair.name }}（{{ a.pair_id }}）</dd>
   <dt>层级</dt><dd>{{ a.layer }}</dd>
-  <dt>源表（huawei）</dt><dd>{{ a.source_db }}.{{ a.source_table }}</dd>
-  <dt>目标表（aliyun）</dt><dd>{{ a.target_db }}.{{ a.target_table }}</dd>
+  <dt>源表（{{ a.pair.source_cluster_id }}）</dt><dd>{{ a.source_db }}.{{ a.source_table }}</dd>
+  <dt>目标表（{{ a.pair.target_cluster_id }}）</dt><dd>{{ a.target_db }}.{{ a.target_table }}</dd>
   <dt>优先级 / 启用</dt><dd>{{ a.priority }} / {{ "是" if a.enabled else "否" }}</dd>
   <dt>状态 / 版本</dt><dd>{{ m.badge(a.status) }} r{{ a.revision }}</dd>
   <dt>资产槽</dt><dd>{% if a.slot and a.slot.run_id %}被 <a href="/runs/{{ a.slot.run_id }}">运行</a> 占用（{{ a.slot.state }}，{{ ts(a.slot.acquired_at) }}）{% else %}空闲{% endif %}</dd>

@@ -1,28 +1,73 @@
-# srdq 配置示例（srdq-config-v1.3）。未列出的键取内置默认值，完整清单见 docs/03-技术设计.md §15。
-# 未知键、旧版本号和与 v1.3 固定语义冲突的值都会被拒绝；改完先运行 `srdq check-config`。
-spec_version: srdq-config-v1.3
+# srdq 配置示例（srdq-config-v1.4）。未知键和旧版本号会被拒绝；改完先运行 `srdq check-config`。
+spec_version: srdq-config-v1.4
 
-# 首次部署保持 false：只做导入、范围发现、规则批准，不派发业务检查。PoC 准备好后再改为 true。
 run_enabled: false
 
 deployment:
-  mode: CENTRAL                 # 首期只实现 CENTRAL：Controller、Web、两个执行器都在阿里 ECS
+  mode: CENTRAL
   controller_location: ALIYUN
 
-execution_window:               # 本地时区；可以跨午夜
+physical_clusters:
+  - id: huawei-1
+    name: Huawei 1
+    cloud: HUAWEI
+    connection_ref: sr-huawei-1-ro
+    credential_file: /etc/srdq/secrets/huawei-1.json
+    os_user: srdq-hw1
+    concurrency: {COUNT: 40, METRIC: 20, SAMPLE: 10, METADATA: 2, DEEP: 2}
+  - id: aliyun-1
+    name: Aliyun 1
+    cloud: ALIYUN
+    connection_ref: sr-aliyun-1-ro
+    credential_file: /etc/srdq/secrets/aliyun-1.json
+    os_user: srdq-al1
+    concurrency: {COUNT: 40, METRIC: 20, SAMPLE: 10, METADATA: 2, DEEP: 2}
+  - id: huawei-2
+    name: Huawei 2
+    cloud: HUAWEI
+    connection_ref: sr-huawei-2-ro
+    credential_file: /etc/srdq/secrets/huawei-2.json
+    os_user: srdq-hw2
+    concurrency: {COUNT: 40, METRIC: 20, SAMPLE: 10, METADATA: 2, DEEP: 2}
+  - id: aliyun-2
+    name: Aliyun 2
+    cloud: ALIYUN
+    connection_ref: sr-aliyun-2-ro
+    credential_file: /etc/srdq/secrets/aliyun-2.json
+    os_user: srdq-al2
+    concurrency: {COUNT: 40, METRIC: 20, SAMPLE: 10, METADATA: 2, DEEP: 2}
+  - id: huawei-3
+    name: Huawei 3
+    cloud: HUAWEI
+    connection_ref: sr-huawei-3-ro
+    credential_file: /etc/srdq/secrets/huawei-3.json
+    os_user: srdq-hw3
+    concurrency: {COUNT: 40, METRIC: 20, SAMPLE: 10, METADATA: 2, DEEP: 2}
+  - id: aliyun-3
+    name: Aliyun 3
+    cloud: ALIYUN
+    connection_ref: sr-aliyun-3-ro
+    credential_file: /etc/srdq/secrets/aliyun-3.json
+    os_user: srdq-al3
+    concurrency: {COUNT: 40, METRIC: 20, SAMPLE: 10, METADATA: 2, DEEP: 2}
+
+cluster_pairs:
+  - {id: pair-1, name: Pair 1, source_cluster_id: huawei-1, target_cluster_id: aliyun-1}
+  - {id: pair-2, name: Pair 2, source_cluster_id: huawei-2, target_cluster_id: aliyun-2}
+  - {id: pair-3, name: Pair 3, source_cluster_id: huawei-3, target_cluster_id: aliyun-3}
+
+execution_window:
   timezone: Asia/Shanghai
   open_at: "20:00"
-  drain_at: "07:30"             # 之后不再派新工作，已开始的观察可以收尾
-  close_at: "08:00"             # 到点取消并确认终止
+  drain_at: "07:30"
+  close_at: "08:00"
 
 execution:
-  concurrency_per_cluster: 40   # 每个集群的并发上限，负载保护可临时下调
   query_timeout_seconds: 300
   lease_seconds: 120
   heartbeat_seconds: 30
 
 transfer:
-  # 客户书面审批编号。保持尖括号占位符时，样本和分组值不会外传，METRIC / SAMPLE 规则显示为 BLOCKED。
   global_approval_ref: "<待登记：客户书面审批依据>"
 
 retention:
@@ -33,13 +78,10 @@ report:
   grace_minutes: 15
 
 credentials:
-  # 每个 side 一个 0600 凭证文件，属主为该 side 执行器的系统用户；Controller / Web 不能读取。
-  huawei: {connection_ref: sr-huawei-ro, file: /etc/srdq/secrets/huawei.json, os_user: srdq-hw, mode: "0600"}
-  aliyun: {connection_ref: sr-aliyun-ro, file: /etc/srdq/secrets/aliyun.json, os_user: srdq-al, mode: "0600"}
   controller_pg: {file: /etc/srdq/secrets/pg.json, os_user: srdq-ctl, mode: "0600"}
 
 web:
-  bind_address: 0.0.0.0         # 监听所有地址，浏览器直接访问 http://<ECS IP>:8470/
+  bind_address: 0.0.0.0
   port: 8470
 
 controller:
@@ -50,4 +92,4 @@ controller:
 executor:
   controller_url: http://127.0.0.1:8471
   data_dir: /var/lib/srdq/executor
-  poll_seconds: 0.2            # 执行器领取工作的轮询间隔（秒）
+  poll_seconds: 0.2

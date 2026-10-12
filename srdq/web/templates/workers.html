@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% import "macros.html" as m with context %}
 {% block content %}
-<p class="muted">逻辑 side 表示读哪一端集群；执行地点表示执行器实际部署的位置。执行器令牌只在创建时显示一次，用命令行 <code>srdq worker-token create</code> 生成。</p>
+<p class="muted">每个执行器只读取一个物理集群；执行地点表示执行器实际部署的位置。执行器令牌只在创建时显示一次，用命令行 <code>srdq worker-token create</code> 生成。</p>
 <table>
-  <tr><th>名称</th><th>逻辑 side</th><th>执行地点</th><th>状态</th><th>注册</th><th>注册时间</th><th>最近心跳</th><th>SR 版本</th><th>S1</th><th>统计</th><th></th></tr>
+  <tr><th>名称</th><th>物理集群</th><th>执行地点</th><th>状态</th><th>注册</th><th>注册时间</th><th>最近心跳</th><th>SR 版本</th><th>S1</th><th>统计</th><th></th></tr>
   {% for w in items %}
   <tr>
-    <td>{{ w.name }}</td><td>{{ w.side }}</td><td>{{ w.execution_location }}</td><td>{{ m.badge(w.status) }}</td>
+    <td>{{ w.name }}</td><td>{{ w.cluster_id }}</td><td>{{ w.execution_location }}</td><td>{{ m.badge(w.status) }}</td>
     <td>{{ m.badge(w.registration_status) }}</td><td>{{ ts(w.registered_at) }}</td><td>{{ ts(w.last_heartbeat_at) }}</td>
     <td>{{ w.sr_version or "" }}</td><td>{{ w.s1_status or "" }}</td>
     <td>{% if w.stats %}<details><summary>展开</summary>{{ m.json(w.stats) }}</details>{% endif %}</td>

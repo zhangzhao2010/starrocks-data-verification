@@ -21,8 +21,9 @@
     </div>
     {{ m.kinds_picker() }}
     <label>rule_key（逗号分隔，可空） <input type="text" name="rule_keys"></label>
-    <div class="choices">层级：{% for l in LAYERS %}<label><input type="checkbox" name="layers" value="{{ l }}"> {{ l }}</label>{% endfor %}<span class="muted">（不选＝全部资产）</span></div>
-    <label>或指定资产 ID（逗号或换行分隔） <textarea name="asset_ids" rows="2"></textarea></label>
+    <div class="choices">校验组：{% for p in PAIRS %}<label><input type="checkbox" name="pair_ids" value="{{ p.id }}"> {{ p.name }}（{{ p.id }}）</label>{% endfor %}<span class="muted">（可单选、多选；不选则继续按层级或全部资产）</span></div>
+    <div class="choices">层级：{% for l in LAYERS %}<label><input type="checkbox" name="layers" value="{{ l }}"> {{ l }}</label>{% endfor %}<span class="muted">（校验组优先于层级）</span></div>
+    <label>或指定资产 ID（逗号或换行分隔，优先级最高） <textarea name="asset_ids" rows="2"></textarea></label>
     {{ m.reason(required=False) }}
     <button type="submit">创建</button>
   </form>

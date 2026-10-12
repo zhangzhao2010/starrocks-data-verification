@@ -22,6 +22,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from srdq import config  # noqa: E402
 from srdq.executor.adapter.sim import SimCluster  # noqa: E402
 
 ORDER_COLS = [("id", "bigint", False), ("name", "varchar(64)"), ("amt", "decimal(18,2)"), ("dt", "date"),
@@ -29,18 +30,18 @@ ORDER_COLS = [("id", "bigint", False), ("name", "varchar(64)"), ("amt", "decimal
 DT_PARTS = {"kind": "RANGE", "column": "dt",
             "partitions": [{"name": f"p2026100{d}", "lower": f"2026-10-0{d}", "upper": f"2026-10-0{d + 1}"}
                            for d in range(1, 8)]}
-ASSETS = """layer,source_db,source_table,target_db,target_table,priority,enabled
-ODS,ods,orders,ods,orders,80,true
-ODS,ods,customers,ods,customers,50,true
-DWD,dwd,order_detail,dwd,order_detail,50,true
+ASSETS = """layer,pair_id,source_db,source_table,target_db,target_table,priority,enabled
+ODS,legacy,ods,orders,ods,orders,80,true
+ODS,legacy,ods,customers,ods,customers,50,true
+DWD,legacy,dwd,order_detail,dwd,order_detail,50,true
 """
-METRIC = """source_db,source_table,rule_key,group_by,filter,metric_id,function,column,scale,compare,rtol,atol
-ods,orders,amt_by_cat,cat,,amt_sum,SUM,amt,2,EXACT,,
-ods,orders,amt_by_cat,cat,,id_cnt,COUNT_NONNULL,id,,EXACT,,
+METRIC = """pair_id,source_db,source_table,rule_key,group_by,filter,metric_id,function,column,scale,compare,rtol,atol
+legacy,ods,orders,amt_by_cat,cat,,amt_sum,SUM,amt,2,EXACT,,
+legacy,ods,orders,amt_by_cat,cat,,id_cnt,COUNT_NONNULL,id,,EXACT,,
 """
-SAMPLE = """source_db,source_table,key_column,compare_columns,float_rtol,float_atol
-ods,orders,id,*,,
-ods,customers,cid,*,,
+SAMPLE = """pair_id,source_db,source_table,key_column,compare_columns,float_rtol,float_atol
+legacy,ods,orders,id,*,,
+legacy,ods,customers,cid,*,,
 """
 
 
@@ -71,6 +72,8 @@ def main() -> None:
     import pgserver
 
     base = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/srdq-demo").resolve()
+    web_port = int(os.environ.get("SRDQ_DEMO_WEB_PORT", "8470"))
+    controller_port = int(os.environ.get("SRDQ_DEMO_CONTROLLER_PORT", "8471"))
     base.mkdir(parents=True, exist_ok=True)
     os.chmod(base, 0o700)
     srv = pgserver.get_server(str(base / "pg"), cleanup_mode="stop")
@@ -81,16 +84,22 @@ def main() -> None:
     dsn = uri.replace("/postgres?", "/srdq_demo?")
 
     cfg = {
-        "spec_version": "srdq-config-v1.3", "run_enabled": True,
+        "spec_version": "srdq-config-v1.4", "run_enabled": True,
         "execution_window": {"timezone": "Asia/Shanghai", "open_at": "00:00", "drain_at": "23:55",
                              "close_at": "23:59"},
         "transfer": {"global_approval_ref": "DEMO-APPROVAL"},
         "execution": {"retry_backoff_seconds": 5},
         "report": {"dir": str(base / "reports")},
-        "credentials": {s: {"file": str(base / f"no-{s}.json")} for s in ("huawei", "aliyun")}
-        | {"controller_pg": {"file": str(base / "pg.json")}},
-        "controller": {"data_dir": str(base / "controller"), "tick_seconds": 1},
-        "executor": {"data_dir": str(base / "executor"), "poll_seconds": 1},
+        "physical_clusters": [
+            {**cluster, "credential_file": str(base / f"no-{cluster['id']}.json")}
+            for cluster in config.DEFAULTS["physical_clusters"]
+        ],
+        "credentials": {"controller_pg": {"file": str(base / "pg.json")}},
+        "web": {"port": web_port},
+        "controller": {"data_dir": str(base / "controller"), "tick_seconds": 1,
+                       "worker_api_port": controller_port},
+        "executor": {"data_dir": str(base / "executor"), "poll_seconds": 1,
+                     "controller_url": f"http://127.0.0.1:{controller_port}"},
     }
     (base / "config.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
     pg_file = base / "pg.json"
@@ -107,7 +116,7 @@ def main() -> None:
     for side in ("huawei", "aliyun"):
         tok = base / f"token-{side}"
         if not tok.exists():
-            subprocess.run(srdq + ["worker-token", "create", "--name", f"demo-{side}", "--side", side,
+            subprocess.run(srdq + ["worker-token", "create", "--name", f"demo-{side}", "--cluster-id", side,
                                    "--out", str(tok)], env=env, check=True, stdout=subprocess.DEVNULL)
     for name, text in (("assets.csv", ASSETS), ("metric_rules.csv", METRIC), ("sample_rules.csv", SAMPLE)):
         (base / name).write_text(text, encoding="utf-8")
@@ -118,15 +127,17 @@ def main() -> None:
     procs = [subprocess.Popen(srdq + ["controller", "--dev"], env=env),
              subprocess.Popen(srdq + ["web", "--dev"], env=env)]
     for side in ("huawei", "aliyun"):
-        procs.append(subprocess.Popen(srdq + ["executor", "--side", side, "--sim", str(base / f"sr_{side}"),
-                                              "--token-file", str(base / f"token-{side}"), "--dev"], env=env))
+        procs.append(subprocess.Popen(srdq + ["executor", "--cluster-id", side, "--sim",
+                                              str(base / f"sr_{side}"), "--token-file", str(base / f"token-{side}"),
+                                              "--dev"], env=env))
+    health_url = f"http://127.0.0.1:{web_port}/v1/health"
     for _ in range(100):
         try:
-            if httpx.get("http://127.0.0.1:8470/v1/health", timeout=1).status_code == 200:
+            if httpx.get(health_url, timeout=1).status_code == 200:
                 break
         except httpx.HTTPError:
             time.sleep(0.2)
-    print(f"\nsrdq demo is up: http://127.0.0.1:8470   (data in {base}; rule templates: "
+    print(f"\nsrdq demo is up: http://127.0.0.1:{web_port}   (data in {base}; rule templates: "
           f"{base / 'metric_rules.csv'}, {base / 'sample_rules.csv'})\n"
           "next: 范围清单 → 发现分区 → 确认；计划 → 新建 → 开始运行。Ctrl-C to stop.\n", flush=True)
     try:

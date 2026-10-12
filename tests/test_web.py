@@ -12,7 +12,7 @@ from srdq.web.app import create_web_app
 
 BASE = "http://127.0.0.1:8470"
 ORIGIN = {"Origin": BASE}
-CSV = b"layer,source_db,source_table,target_db,target_table,priority,enabled\nODS,db1,orders,db1,orders,50,true\n"
+CSV = b"layer,pair_id,source_db,source_table,target_db,target_table,priority,enabled\nODS,legacy,db1,orders,db1,orders,50,true\n"
 
 
 @pytest.fixture()
@@ -362,8 +362,8 @@ def test_ui_flow_end_to_end(h, web):
     submit(web, f"/manifests/{mid}", r"/actions/manifests/[^/]+/confirm", {"reason": "确认"})
     assert h.ctx.db.one("SELECT status FROM dq_manifest WHERE id=%s", (mid,))["status"] == "CONFIRMED"
 
-    metric = ("source_db,source_table,rule_key,group_by,filter,metric_id,function,column,scale,compare,rtol,atol\n"
-              "db1,orders,m1,dt,,amt,SUM,amount,2,EXACT,,\n").encode()
+    metric = ("pair_id,source_db,source_table,rule_key,group_by,filter,metric_id,function,column,scale,compare,rtol,atol\n"
+              "legacy,db1,orders,m1,dt,,amt,SUM,amount,2,EXACT,,\n").encode()
     loc, _ = submit(web, "/imports", "/actions/imports/preview", {"kind": "METRIC_TEMPLATE"},
                     files={"file": ("metric.csv", metric, "text/csv")})
     submit(web, loc, r"/actions/imports/[^/]+/confirm", {"reason": "规则"})

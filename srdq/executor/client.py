@@ -1,11 +1,11 @@
-"""HTTP client for the controller's worker API (side-bound bearer token)."""
+"""HTTP client for the controller's cluster-bound worker API."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import httpx
 
-PROTOCOL_VERSION = "srdq-v1.3"
+PROTOCOL_VERSION = "srdq-v1.4"
 
 
 class ApiRejected(Exception):
@@ -40,12 +40,14 @@ class WorkerClient:
             raise ApiRejected(r.status_code, code, msg)
         return r.json()
 
-    def register(self, boot_id: str, side: str, capabilities: dict) -> dict:
-        return self._post("/v1/worker/registrations", {"boot_id": boot_id, "side": side, "capabilities": capabilities})
+    def register(self, boot_id: str, cluster_id: str, capabilities: dict) -> dict:
+        return self._post("/v1/worker/registrations",
+                          {"boot_id": boot_id, "cluster_id": cluster_id, "capabilities": capabilities})
 
-    def claim(self, registration_id: str, control_generation: str, max_items: int) -> dict:
+    def claim(self, registration_id: str, control_generation: str, max_items: int, claim_kind: str) -> dict:
         return self._post("/v1/worker/claims", {"registration_id": registration_id,
-                                                "control_generation": control_generation, "max_items": max_items})
+                                                "control_generation": control_generation,
+                                                "max_items": max_items, "claim_kind": claim_kind})
 
     def heartbeat(self, registration_id: str, control_generation: str, attempts: list[dict],
                   signals: dict | None = None) -> dict:

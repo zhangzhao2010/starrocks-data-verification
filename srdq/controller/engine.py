@@ -102,19 +102,20 @@ def step_cancel_pending_alert(ctx: Ctx) -> None:
     secs = int(ctx.cfg["execution"]["cancel_pending_alert_seconds"])
     with ctx.db.tx() as cur:
         lock_control(cur)
-        cur.execute("""SELECT side, count(*) AS n, min(lease_expires_at) AS oldest FROM dq_attempt
+        cur.execute("""SELECT cluster_id, count(*) AS n, min(lease_expires_at) AS oldest FROM dq_attempt
                        WHERE status IN ('CANCEL_REQUESTED','CANCEL_PENDING')
                          AND lease_expires_at + make_interval(secs => %s) < now()
-                       GROUP BY side""", (secs,))
-        stuck = {r["side"]: r for r in cur.fetchall()}
-        for side in ("huawei", "aliyun"):
-            r = stuck.get(side)
+                       GROUP BY cluster_id""", (secs,))
+        stuck = {r["cluster_id"]: r for r in cur.fetchall()}
+        for cluster_id in ctx.cfg.cluster_ids:
+            r = stuck.get(cluster_id)
             if r is None:
-                close_incident(cur, "CANCEL_PENDING_TIMEOUT", side)
+                close_incident(cur, "CANCEL_PENDING_TIMEOUT", cluster_id)
             else:
-                incident(cur, "CANCEL_PENDING_TIMEOUT", side,
-                         f"{r['n']} queries on {side} could not be confirmed as stopped; asset slots stay held",
-                         side=side, severity="CRITICAL", detail={"count": r["n"], "oldest": iso(r["oldest"])})
+                incident(cur, "CANCEL_PENDING_TIMEOUT", cluster_id,
+                         f"{r['n']} queries on {cluster_id} could not be confirmed as stopped; asset slots stay held",
+                         cluster_id=cluster_id, severity="CRITICAL",
+                         detail={"count": r["n"], "oldest": iso(r["oldest"])})
 
 
 # ---- queue and completion ------------------------------------------------------------------------

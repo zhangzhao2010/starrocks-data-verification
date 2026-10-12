@@ -5,12 +5,11 @@ from typing import Any
 
 from ..common import dsl
 from ..db.db import jb, new_id
-from .common import SIDES, ApiError, Ctx, as_uuid, audit, digest_json, lock_control
+from .common import ApiError, Ctx, as_uuid, audit, digest_json, lock_control
 from .importer import common_columns
 
 ORDERABLE = ("INTEGER", "DECIMAL", "DATE", "DATETIME", "STRING")
 LISTABLE = ORDERABLE + ("BOOLEAN",)
-SIDE_KEY = {"huawei": "source", "aliyun": "target"}
 TERMINAL_RUN = ("COMPLETED", "FAILED", "CANCELLED")
 
 
@@ -33,13 +32,19 @@ def discover(ctx: Ctx, reason: str | None = None) -> dict:
         cur.execute("""INSERT INTO dq_run (id, purpose, config_snapshot, execution_state, reason)
                        VALUES (%s, 'METADATA_PREVIEW', %s, 'READY', %s)""", (rid, jb(dict(ctx.cfg)), reason))
         for a in assets:
-            for side in SIDES:
-                db, tbl = (a["source_db"], a["source_table"]) if side == "huawei" else (a["target_db"],
-                                                                                      a["target_table"])
-                cur.execute("""INSERT INTO dq_work_item (id, run_id, asset_id, side, kind, scan_unit_id, spec)
+            cur.execute("SELECT source_cluster_id, target_cluster_id FROM dq_cluster_pair WHERE id=%s AND enabled",
+                        (a["pair_id"],))
+            pair = cur.fetchone()
+            if pair is None:
+                raise ApiError(422, "CLUSTER_PAIR_DISABLED", f"cluster pair {a['pair_id']} is unavailable")
+            endpoints = ((pair["source_cluster_id"], a["source_db"], a["source_table"]),
+                         (pair["target_cluster_id"], a["target_db"], a["target_table"]))
+            for cluster_id, db, tbl in endpoints:
+                cur.execute("""INSERT INTO dq_work_item (id, run_id, asset_id, cluster_id, kind, scan_unit_id, spec)
                                VALUES (%s,%s,%s,%s,'METADATA',%s,%s)""",
-                            (new_id(), rid, a["id"], side, new_id(),
-                             jb({"kind": "METADATA", "side": side, "table": {"db": db, "table": tbl}})))
+                            (new_id(), rid, a["id"], cluster_id, new_id(),
+                             jb({"kind": "METADATA", "cluster_id": cluster_id,
+                                 "table": {"db": db, "table": tbl}})))
         audit(cur, "DISCOVERY_STARTED", "run", rid, {"assets": len(assets)}, reason)
     return {"run_id": str(rid), "assets": len(assets), "work_items": len(assets) * 2}
 
@@ -214,13 +219,17 @@ def _carry(base_entries: list[dict], current: list[dict], blocked: bool, s: str,
 
 def build_draft(cur, ctx: Ctx, run_id) -> dict:
     """Build a DRAFT manifest from a finished discovery run (caller holds the run row lock)."""
-    cur.execute("SELECT asset_id, side, status, result FROM dq_work_item WHERE run_id=%s AND kind='METADATA'",
-                (run_id,))
+    cur.execute("""SELECT w.asset_id, w.cluster_id, w.status, w.result,
+                          p.source_cluster_id, p.target_cluster_id
+                   FROM dq_work_item w JOIN dq_asset a ON a.id=w.asset_id
+                   JOIN dq_cluster_pair p ON p.id=a.pair_id
+                   WHERE w.run_id=%s AND w.kind='METADATA'""", (run_id,))
     metas: dict[str, dict] = {}
     for w in cur.fetchall():
         res = w["result"] or {}
         meta = res.get("meta") or {"status": "UNKNOWN", "message": (res.get("failure") or {}).get("message")}
-        metas.setdefault(str(w["asset_id"]), {})[SIDE_KEY[w["side"]]] = meta
+        role = "source" if w["cluster_id"] == w["source_cluster_id"] else "target"
+        metas.setdefault(str(w["asset_id"]), {})[role] = meta
     cur.execute("SELECT id FROM dq_manifest WHERE status='CONFIRMED'")
     base = cur.fetchone()
     base_entries: dict[str, list[dict]] = {}

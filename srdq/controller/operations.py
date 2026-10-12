@@ -6,7 +6,7 @@ from typing import Any
 
 from ..db.db import jb, new_id
 from . import evaluate, loadguard, planning, queue, window
-from .common import (SIDES, ApiError, Ctx, as_uuid, audit, close_incident, digest_json, incident, iso,
+from .common import (ApiError, Ctx, as_uuid, audit, close_incident, digest_json, incident, iso,
                      lock_control, parse_ts)
 
 CONTROL_OPS = ("START", "RESUME", "PAUSE", "CANCEL", "ARCHIVE", "RESTORE", "SET_PRIORITY", "CLEAR_PRIORITY")
@@ -54,8 +54,8 @@ def _normalize(ctx: Ctx, body: dict) -> dict:
     if tt == "GLOBAL":
         ids: list[str] = []
     elif tt == "CLUSTER":
-        if len(raw_ids) != 1 or raw_ids[0] not in SIDES:
-            raise ApiError(422, "BAD_TARGETS", f"CLUSTER target_ids must be one of {SIDES}")
+        if len(raw_ids) != 1 or raw_ids[0] not in ctx.cfg.cluster_ids:
+            raise ApiError(422, "BAD_TARGETS", f"CLUSTER target_ids must be one of {ctx.cfg.cluster_ids}")
         ids = [raw_ids[0]]
     else:
         if not raw_ids or len(raw_ids) > MAX_TARGETS:
@@ -223,10 +223,11 @@ def _in_flight(cur, rc_ids: list[str]) -> dict:
                           count(*) FILTER (WHERE started_at IS NULL) AS unstarted
                    FROM dq_observation WHERE run_check_id = ANY(%s::uuid[]) AND status='OPEN'""", (rc_ids,))
     o = cur.fetchone()
-    cur.execute("""SELECT a.side, count(*) AS n FROM dq_work_item w JOIN dq_attempt a ON a.id = w.current_attempt_id
+    cur.execute("""SELECT a.cluster_id, count(*) AS n FROM dq_work_item w
+                   JOIN dq_attempt a ON a.id = w.current_attempt_id
                    WHERE w.run_check_id = ANY(%s::uuid[]) AND a.status IN
-                   ('LEASED','RUNNING','CANCEL_REQUESTED','CANCEL_PENDING') GROUP BY a.side""", (rc_ids,))
-    live = {s: 0 for s in SIDES} | {r["side"]: r["n"] for r in cur.fetchall()}
+                   ('LEASED','RUNNING','CANCEL_REQUESTED','CANCEL_PENDING') GROUP BY a.cluster_id""", (rc_ids,))
+    live = {r["cluster_id"]: r["n"] for r in cur.fetchall()}
     cur.execute("""SELECT count(*) AS units, COALESCE(sum((rc.execution_snapshot->>'result_cap')::numeric), 0) AS cap
                    FROM dq_work_item w JOIN dq_observation o ON o.id = w.observation_id
                    JOIN dq_run_check rc ON rc.id = w.run_check_id
@@ -288,13 +289,13 @@ def _build_preview(cur, ctx: Ctx, req: dict, lock: bool = False) -> dict:
                 raise ApiError(409, "NOT_IN_RECOVERY", "controller is not in recovery")
             pv["unknown_periods"] = ctl["unknown_periods"]
         elif op == "RESUME_CLUSTER":
-            side = req["target_ids"][0]
-            st = (ctl["cluster_state"] or {}).get(side) or {}
-            pv["cluster"] = {"side": side, "hard_stop": bool(st.get("hard_stop")), "concurrency": st.get("concurrency")}
+            cluster_id = req["target_ids"][0]
+            st = (ctl["cluster_state"] or {}).get(cluster_id) or {}
+            pv["cluster"] = {"cluster_id": cluster_id, "hard_stop": bool(st.get("hard_stop"))}
             if not st.get("hard_stop"):
-                warnings.append(f"{side} is not hard-stopped")
-            cur.execute("""SELECT count(*) AS n FROM dq_attempt WHERE side=%s AND status IN
-                           ('CANCEL_REQUESTED','CANCEL_PENDING')""", (side,))
+                warnings.append(f"{cluster_id} is not hard-stopped")
+            cur.execute("""SELECT count(*) AS n FROM dq_attempt WHERE cluster_id=%s AND status IN
+                           ('CANCEL_REQUESTED','CANCEL_PENDING')""", (cluster_id,))
             pv["cluster"]["unconfirmed_cancels"] = cur.fetchone()["n"]
     pv["warnings"] = warnings
     return pv
@@ -466,7 +467,7 @@ def _apply(cur, ctx: Ctx, op_id, req: dict, pv: dict, reason: str, to_eval: list
         return {"status": "ACTIVE"}
     if op == "RESUME_CLUSTER":
         st = loadguard.resume_cluster(cur, req["target_ids"][0], reason)
-        return {"side": req["target_ids"][0], "concurrency": st["concurrency"], "hard_stop": False}
+        return {"cluster_id": req["target_ids"][0], "hard_stop": False}
     targets = _load_targets(cur, req, True)
     if op == "REGENERATE":
         return _apply_regenerate(cur, ctx, req, targets, pv["regenerate"], reason)

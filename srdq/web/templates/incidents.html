@@ -6,8 +6,8 @@
     {% for s in ["OPEN", "CLOSED"] %}<option value="{{ s }}"{% if query.get("state") == s %} selected{% endif %}>{{ s }}</option>{% endfor %}
   </select></label>
   <label>类型 <input type="text" name="kind" value="{{ query.get('kind', '') }}" placeholder="例如 STORAGE_SUSPECT"></label>
-  <label>集群 <select name="side"><option value="">全部</option>
-    {% for s in SIDES %}<option value="{{ s }}"{% if query.get("side") == s %} selected{% endif %}>{{ s }}</option>{% endfor %}
+  <label>集群 <select name="cluster_id"><option value="">全部</option>
+    {% for c in CLUSTERS %}<option value="{{ c.id }}"{% if query.get("cluster_id") == c.id %} selected{% endif %}>{{ c.name }}（{{ c.id }}）</option>{% endfor %}
   </select></label>
   <button type="submit">筛选</button>
 </form>
@@ -16,7 +16,7 @@
   {% for i in data["items"] %}
   <tr class="{{ 'rowerr' if i.severity == 'CRITICAL' and i.state == 'OPEN' else '' }}">
     <td>{{ ts(i.last_seen) }}</td><td>{{ ts(i.first_seen) }}</td><td>{{ m.badge(i.severity) }}</td>
-    <td>{{ i.kind }}</td><td>{{ i.side or "" }}</td><td>{{ m.badge(i.state) }}</td><td class="num">{{ i.occurrences }}</td>
+    <td>{{ i.kind }}</td><td>{{ i.cluster_id or "" }}</td><td>{{ m.badge(i.state) }}</td><td class="num">{{ i.occurrences }}</td>
     <td>{{ i.message }}{% if i.error_code %} <span class="muted">[{{ i.error_code }}]</span>{% endif %}
       {% if i.detail %}<details><summary>详情</summary>{{ m.json(i.detail) }}</details>{% endif %}</td>
     <td class="small">

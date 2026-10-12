@@ -49,13 +49,17 @@ class Outcome:
     target_read: tuple
 
 
-def _pairs(results: list[dict]) -> dict[str, dict[str, dict]]:
+def _pairs(results: list[dict], source_cluster_id: str, target_cluster_id: str) -> dict[str, dict[str, dict]]:
     out: dict[str, dict[str, dict]] = {}
     for r in results:
-        out.setdefault(str(r["node_id"]), {})[r["side"]] = r
-    for nid, p in out.items():
-        if set(p) != {"huawei", "aliyun"}:
-            raise CompareError(f"member {nid} lacks an accepted result on both sides")
+        role = "source" if r["cluster_id"] == source_cluster_id else \
+            "target" if r["cluster_id"] == target_cluster_id else None
+        if role is None:
+            raise CompareError(f"result belongs to unexpected cluster {r['cluster_id']}")
+        out.setdefault(str(r["node_id"]), {})[role] = r
+    for nid, pair in out.items():
+        if set(pair) != {"source", "target"}:
+            raise CompareError(f"member {nid} lacks an accepted result on both clusters")
     return out
 
 
@@ -64,12 +68,16 @@ def _read_window(rs: list[dict]) -> tuple:
 
 
 def compare(ctx: Ctx, rc: dict, results: list[dict], load_groups: Callable[[Any], dict] | None = None) -> Outcome:
-    """Compare the ACCEPTED side results of one completed observation."""
-    pairs = _pairs(results)
-    src = [p["huawei"] for p in pairs.values()]
-    tgt = [p["aliyun"] for p in pairs.values()]
+    """Compare the ACCEPTED cluster results of one completed observation."""
+    xs = rc["execution_snapshot"]
+    source_cluster_id, target_cluster_id = xs["source_cluster_id"], xs["target_cluster_id"]
+    pairs = _pairs(results, source_cluster_id, target_cluster_id)
+    src = [p["source"] for p in pairs.values()]
+    tgt = [p["target"] for p in pairs.values()]
     diffs = Diffs(int(ctx.cfg["retention"]["max_difference_rows"]))
-    out = Outcome("OBSERVED_EQUAL", None, {}, diffs, [r["id"] for r in src], [r["id"] for r in tgt],
+    summary = {"pair_id": xs["pair_id"], "source_cluster_id": source_cluster_id,
+               "target_cluster_id": target_cluster_id}
+    out = Outcome("OBSERVED_EQUAL", None, summary, diffs, [r["id"] for r in src], [r["id"] for r in tgt],
                   _read_window(src), _read_window(tgt))
     skew = _skew(ctx, pairs)
     out.summary["timing"] = skew
@@ -92,14 +100,16 @@ def compare(ctx: Ctx, rc: dict, results: list[dict], load_groups: Callable[[Any]
     return out
 
 
-def error_outcome(ctx: Ctx, results: list[dict], message: str) -> Outcome:
-    src = [r for r in results if r["side"] == "huawei"]
-    tgt = [r for r in results if r["side"] == "aliyun"]
+def error_outcome(ctx: Ctx, rc: dict, results: list[dict], message: str) -> Outcome:
+    xs = rc["execution_snapshot"]
+    src = [r for r in results if r["cluster_id"] == xs["source_cluster_id"]]
+    tgt = [r for r in results if r["cluster_id"] == xs["target_cluster_id"]]
     if not src or not tgt:
-        raise CompareError("cannot record a comparison without results on both sides")
-    return Outcome("ERROR", "COMPARE_FAILED", {"error": message[:2000]},
-                   Diffs(int(ctx.cfg["retention"]["max_difference_rows"])), [r["id"] for r in src],
-                   [r["id"] for r in tgt], _read_window(src), _read_window(tgt))
+        raise CompareError("cannot record a comparison without results from both clusters")
+    summary = {"error": message[:2000], "pair_id": xs["pair_id"],
+               "source_cluster_id": xs["source_cluster_id"], "target_cluster_id": xs["target_cluster_id"]}
+    return Outcome("ERROR", "COMPARE_FAILED", summary, Diffs(int(ctx.cfg["retention"]["max_difference_rows"])),
+                   [r["id"] for r in src], [r["id"] for r in tgt], _read_window(src), _read_window(tgt))
 
 
 def _skew(ctx: Ctx, pairs: dict) -> dict:
@@ -109,7 +119,7 @@ def _skew(ctx: Ctx, pairs: dict) -> dict:
     worst_skew = worst_span = 0.0
     violation = None
     for p in pairs.values():
-        s, t = p["huawei"], p["aliyun"]
+        s, t = p["source"], p["target"]
         sk = abs((s["read_started"] - t["read_started"]).total_seconds())
         span = (max(s["read_finished"], t["read_finished"]) - min(s["read_started"], t["read_started"])).total_seconds()
         worst_skew, worst_span = max(worst_skew, sk), max(worst_span, span)
@@ -136,8 +146,8 @@ def _finish(out: Outcome, unsupported: str | None = None, inconclusive: str | No
 
 def _count(pairs: dict, out: Outcome) -> None:
     (p,) = pairs.values()
-    s = int(p["huawei"]["payload"]["row_count"])
-    t = int(p["aliyun"]["payload"]["row_count"])
+    s = int(p["source"]["payload"]["row_count"])
+    t = int(p["target"]["payload"]["row_count"])
     out.summary.update(source_rows=str(s), target_rows=str(t))
     if s != t:
         rel = None if s == 0 else str((Decimal(abs(t - s)) / Decimal(s)).quantize(Decimal("0.000001")))
@@ -185,7 +195,7 @@ def _delta(m: dict, a: dict, b: dict) -> dict:
 
 def _metric(d: dict, pairs: dict, out: Outcome, loader: Callable[[Any], dict]) -> None:
     (p,) = pairs.values()
-    sg, tg = loader(p["huawei"]["id"]), loader(p["aliyun"]["id"])
+    sg, tg = loader(p["source"]["id"]), loader(p["target"]["id"])
     metrics = d["metrics"]
     sums = [m["id"] for m in metrics if m["function"] == "SUM"]
     non_finite = False
@@ -323,7 +333,7 @@ def _keyed_rows(rows: Rows, sl: Iterator[dict], tl: Iterator[dict], out: Outcome
 
 def _sample(ctx: Ctx, d: dict, cols: dict, pairs: dict, out: Outcome) -> None:
     (p,) = pairs.values()
-    s, t = p["huawei"], p["aliyun"]
+    s, t = p["source"], p["target"]
     rows = Rows(d, cols)
     sp, tp = s["payload"], t["payload"]
     ns, nt = int(sp["sample_rows"]), int(tp["sample_rows"])
@@ -351,7 +361,7 @@ def _deep(ctx: Ctx, d: dict, cols: dict, evidence: str, pairs: dict, out: Outcom
     members_equal = 0
     tot_s = tot_t = 0
     for nid in sorted(pairs):
-        s, t = pairs[nid]["huawei"], pairs[nid]["aliyun"]
+        s, t = pairs[nid]["source"], pairs[nid]["target"]
         sp, tp = s["payload"], t["payload"]
         ns, nt = int(sp["row_count"]), int(tp["row_count"])
         tot_s, tot_t = tot_s + ns, tot_t + nt

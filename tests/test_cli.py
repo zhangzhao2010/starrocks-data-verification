@@ -23,7 +23,11 @@ def _write(path, text, mode):
 def _cfg(tmp_path, **creds):
     files = {"huawei": tmp_path / "hw.json", "aliyun": tmp_path / "al.json", "controller_pg": tmp_path / "pg.json"}
     files.update(creds)
-    return config.from_dict({"credentials": {k: {"file": str(v)} for k, v in files.items()}})
+    clusters = []
+    for cluster in config.DEFAULTS["physical_clusters"]:
+        clusters.append({**cluster, "credential_file": str(files[cluster["id"]])})
+    return config.from_dict({"physical_clusters": clusters,
+                             "credentials": {"controller_pg": {"file": str(files["controller_pg"])}}})
 
 
 def test_private_file(tmp_path):
@@ -67,12 +71,12 @@ def test_import_refuses_to_confirm_error_rows(tmp_path, pg_dsn, monkeypatch, cap
     monkeypatch.setenv("SRDQ_PG_DSN", pg_dsn)
     cfgfile = tmp_path / "config.yaml"
     cfgfile.write_text(yaml.safe_dump({"controller": {"data_dir": str(tmp_path / "ctl")}}), encoding="utf-8")
-    bad = _write(tmp_path / "a.csv", "layer,source_db,source_table,target_db,target_table,priority,enabled\n"
-                                     "NOPE,db1,t,db1,t,50,true\n", 0o644)
+    bad = _write(tmp_path / "a.csv", "layer,pair_id,source_db,source_table,target_db,target_table,priority,enabled\n"
+                                     "NOPE,legacy,db1,t,db1,t,50,true\n", 0o644)
     with pytest.raises(cli.CliError, match="ERROR rows"):
         cli.main(["--config", str(cfgfile), "import", "assets", str(bad), "--confirm", "--reason", "r"])
-    good = _write(tmp_path / "b.csv", "layer,source_db,source_table,target_db,target_table,priority,enabled\n"
-                                      "ODS,db1,t,db1,t,50,true\n", 0o644)
+    good = _write(tmp_path / "b.csv", "layer,pair_id,source_db,source_table,target_db,target_table,priority,enabled\n"
+                                      "ODS,legacy,db1,t,db1,t,50,true\n", 0o644)
     cli.main(["--config", str(cfgfile), "import", "assets", str(good), "--confirm", "--reason", "r"])
     assert '"CONFIRMED"' in capsys.readouterr().out
 

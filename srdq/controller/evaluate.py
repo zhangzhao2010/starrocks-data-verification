@@ -39,7 +39,7 @@ def _close_siblings(cur, oid, reason: str) -> None:
 
 def _failure(works: list[dict]) -> dict:
     failed = [w for w in works if w["status"] == "FAILED"]
-    infos = [((w["result"] or {}).get("failure") or {}) | {"side": w["side"]} for w in failed]
+    infos = [((w["result"] or {}).get("failure") or {}) | {"cluster_id": w["cluster_id"]} for w in failed]
     for f in infos:
         if f.get("error_class") not in RETRYABLE:
             return f
@@ -62,7 +62,8 @@ def _on_failed(cur, ctx: Ctx, o: dict, rc: dict, works: list[dict]) -> None:
         return
     issue = dict(rc["issue"] or {})
     issue["last_error"] = {"error_class": cls, "error_code": code, "message": (f.get("message") or "")[:500],
-                           "side": f.get("side"), "observation_id": str(o["id"]), "at": ctx.now().isoformat()}
+                           "cluster_id": f.get("cluster_id"), "observation_id": str(o["id"]),
+                           "at": ctx.now().isoformat()}
     reason = f"{cls}:{code}" if code and code != cls else cls
     if effective_control(cur, rc) in STOPPED:
         _set_rc(cur, rc["id"], execution_state="CANCEL_PENDING" if rc_has_live(cur, rc["id"]) else "CANCELLED",
@@ -138,7 +139,7 @@ def evaluate_observation(ctx: Ctx, oid) -> str | None:
         if o["status"] != "OPEN":
             finalize(cur, o["run_id"], o["asset_id"])
             return o["status"]
-        cur.execute("SELECT * FROM dq_work_item WHERE observation_id=%s ORDER BY side, id FOR UPDATE", (oid,))
+        cur.execute("SELECT * FROM dq_work_item WHERE observation_id=%s ORDER BY cluster_id, id FOR UPDATE", (oid,))
         works = cur.fetchall()
         statuses = {w["status"] for w in works}
         rc = _lock_rc(cur, o["run_check_id"])
@@ -152,13 +153,13 @@ def evaluate_observation(ctx: Ctx, oid) -> str | None:
             return "ABANDONED"
         if statuses != {"DONE"}:
             return "OPEN"
-        cur.execute("SELECT * FROM dq_side_result WHERE observation_id=%s AND validity='ACCEPTED' ORDER BY side, id",
-                    (oid,))
+        cur.execute("SELECT * FROM dq_side_result WHERE observation_id=%s AND validity='ACCEPTED' "
+                    "ORDER BY cluster_id, id", (oid,))
         results = cur.fetchall()
     try:
         outcome = compare.compare(ctx, rc, results, lambda srid: compare.load_groups(ctx.db, srid))
     except Exception as e:  # noqa: BLE001 - any comparison failure becomes an ERROR verdict
-        outcome = compare.error_outcome(ctx, results, f"{type(e).__name__}: {e}")
+        outcome = compare.error_outcome(ctx, rc, results, f"{type(e).__name__}: {e}")
     with ctx.db.tx() as cur:
         lock_control(cur)
         cur.execute("SELECT * FROM dq_observation WHERE id=%s FOR UPDATE", (oid,))

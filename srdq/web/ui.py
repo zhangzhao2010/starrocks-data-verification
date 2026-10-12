@@ -16,7 +16,7 @@ from starlette.datastructures import FormData, UploadFile
 
 from ..controller import (differences, importer, manifest, manual_requests, operations, planning, queue, reports,
                           schedules, views)
-from ..controller.common import KIND_RANK, LAYER_RANK, SIDES, ApiError, Ctx
+from ..controller.common import KIND_RANK, LAYER_RANK, ApiError, Ctx
 from .api import MAX_UPLOAD, preview_import
 
 router = APIRouter()
@@ -62,14 +62,17 @@ def _pct(a: Any, b: Any) -> str:
 
 templates.env.filters["pj"] = _pj
 templates.env.filters["pct"] = _pct
-templates.env.globals.update(KINDS=KINDS, LAYERS=LAYERS, SIDES=list(SIDES))
+templates.env.globals.update(KINDS=KINDS, LAYERS=LAYERS)
 
 
 def page(request: Request, name: str, status: int = 200, **context: Any) -> HTMLResponse:
+    ctx = _ctx(request)
     tz = _tz(request)
     context.setdefault("title", "")
     context["ts"] = lambda v: _ts(v, tz)
     context["tzname"] = str(tz)
+    context["CLUSTERS"] = list(ctx.cfg["physical_clusters"])
+    context["PAIRS"] = list(ctx.cfg["cluster_pairs"])
     context["query"] = dict(request.query_params)
     context["path"] = request.url.path
     return templates.TemplateResponse(request, name, context, status_code=status)
@@ -139,11 +142,14 @@ def check_selector_of(form: FormData) -> dict:
     return sel
 
 
-def asset_selector_of(form: FormData) -> dict:
+def asset_selector_of(form: FormData, ctx: Ctx) -> dict:
     layers = [x for x in form.getlist("layers") if x in LAYERS]
+    pair_ids = [x for x in form.getlist("pair_ids") if x in {p["id"] for p in ctx.cfg["cluster_pairs"]}]
     ids = [x.strip() for x in (text(form, "asset_ids") or "").replace("\n", ",").split(",") if x.strip()]
     if ids:
         return {"asset_ids": ids}
+    if pair_ids:
+        return {"pair_ids": pair_ids}
     if layers:
         return {"layers": layers}
     return {"all": True}
@@ -296,10 +302,11 @@ async def plan_page(request: Request, plan_id: str):
 @router.post("/actions/plans")
 async def act_plan_create(request: Request):
     form = await request.form()
+    ctx = _ctx(request)
     body = {"name": need(form, "name", "计划名称"), "manifest_mode": text(form, "manifest_mode") or "LATEST_CONFIRMED",
             "manifest_id": text(form, "manifest_id"), "check_selector": check_selector_of(form),
-            "asset_selector": asset_selector_of(form)}
-    out = await call(planning.create_plan, _ctx(request), body, reason=text(form, "reason"))
+            "asset_selector": asset_selector_of(form, ctx)}
+    out = await call(planning.create_plan, ctx, body, reason=text(form, "reason"))
     return go(f"/plans/{out['id']}")
 
 

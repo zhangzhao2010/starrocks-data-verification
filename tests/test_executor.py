@@ -5,11 +5,13 @@ from decimal import Decimal
 
 import pytest
 
+from srdq import config
 from srdq.common import canonical as c
 from srdq.executor import compiler, encoder, probe, tasks
 from srdq.executor.adapter.base import AdapterError
 from srdq.executor.adapter.sim import SimAdapter
 from srdq.executor.adapter.starrocks import normalize_model, parse_show_partitions
+from srdq.executor.runner import Active, Executor
 
 SEED = "00000000000000000000000000000000"
 CTX = "11" * 32
@@ -236,3 +238,110 @@ def test_bucket_sql_matches_python_for_extremes(tmp_path):
             sql, params = compiler.compile_s1_probe("INTEGER", v, SEED, n)
             row = a.scalar_row(sql, params)
             assert int(row[2]) == c.s1_bucket(c.single_key("INTEGER", v), SEED, n)
+
+
+class RunnerClient:
+    def __init__(self):
+        self.heartbeat_calls = []
+        self.cancelled_attempts = []
+        self.register_calls = 0
+        self.closed = False
+
+    def register(self, boot_id, cluster_id, capabilities):
+        self.register_calls += 1
+        return {"registration_id": f"registration-{self.register_calls}", "control_generation": "generation",
+                "pending": []}
+
+    def heartbeat(self, registration_id, generation, attempts, signals=None):
+        self.heartbeat_calls.append((attempts, signals))
+        if len(self.heartbeat_calls) == 1:
+            return {"directives": {attempts[0]["attempt_id"]: "CANCEL"}}
+        raise RuntimeError("second batch failed")
+
+    def cancelled(self, body):
+        self.cancelled_attempts.append(body["attempt_id"])
+        return {"ok": True}
+
+    def close(self):
+        self.closed = True
+
+
+def runner_executor(tmp_path, client):
+    cfg = config.from_dict({"controller": {"data_dir": str(tmp_path / "ctl")},
+                            "report": {"dir": str(tmp_path / "reports")}})
+    cfg.cluster("huawei")["concurrency"]["COUNT"] = 1
+    executor = Executor(cfg, "huawei", object(), client, tmp_path / "executor")
+    executor.signals_enabled = False
+    executor.registration_id = "registration"
+    executor.generation = "generation"
+    return executor
+
+
+def active_attempt(number: int) -> Active:
+    return Active({"attempt_id": f"attempt-{number}", "lease_generation": 1, "kind": "CHECK",
+                   "check_kind": "COUNT", "spec": {"kind": "CHECK"}})
+
+
+def test_heartbeat_applies_first_batch_directive_when_second_batch_fails(tmp_path):
+    client = RunnerClient()
+    executor = runner_executor(tmp_path, client)
+    attempts = [active_attempt(n) for n in range(257)]
+    executor.active = {attempt.attempt_id: attempt for attempt in attempts}
+    try:
+        executor.heartbeat_once()
+        assert [len(call[0]) for call in client.heartbeat_calls] == [256, 1]
+        assert attempts[0].cancel.is_set()
+        assert attempts[0].cancel_reason == "CANCEL"
+    finally:
+        executor.active.clear()
+        for pool in executor._pools.values():
+            pool.shutdown(wait=True)
+        executor.outbox.close()
+        executor.client.close()
+
+
+def test_concurrent_stale_handlers_register_only_once(tmp_path):
+    client = RunnerClient()
+    executor = runner_executor(tmp_path, client)
+    executor.registration_id = "stale-registration"
+    executor.probe_capabilities = lambda: {"s1": {"status": "PASS"}}
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(
+        executor.register(("stale-registration", "generation")))) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(2)
+        assert client.register_calls == 1
+        assert sorted(results) == [False, True]
+    finally:
+        for pool in executor._pools.values():
+            pool.shutdown(wait=True)
+        executor.outbox.close()
+        executor.client.close()
+
+
+def test_stop_cancels_queued_attempts_and_clears_active(tmp_path, monkeypatch):
+    client = RunnerClient()
+    executor = runner_executor(tmp_path, client)
+    started = threading.Event()
+
+    def blocked_check(spec, adapter, workdir, *, cancel, on_query_ref, usage):
+        started.set()
+        cancel.wait(5)
+        raise tasks.Cancelled()
+
+    monkeypatch.setattr(tasks, "run_check", blocked_check)
+    first, second = active_attempt(1), active_attempt(2)
+    executor.active = {first.attempt_id: first, second.attempt_id: second}
+    pool = executor._pools["COUNT"]
+    executor._futures[first.attempt_id] = pool.submit(executor._execute, first)
+    assert started.wait(2)
+    executor._futures[second.attempt_id] = pool.submit(executor._execute, second)
+
+    executor.stop(timeout=2)
+
+    assert executor.active == {}
+    assert set(client.cancelled_attempts) == {first.attempt_id, second.attempt_id}
+    assert client.closed

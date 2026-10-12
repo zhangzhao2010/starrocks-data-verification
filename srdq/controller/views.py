@@ -6,8 +6,9 @@ import decimal
 import uuid
 from typing import Any
 
+from ..config import POOL_KINDS
 from . import window
-from .common import KIND_RANK, LAYER_RANK, SIDES, ApiError, Ctx, as_uuid, control, iso
+from .common import KIND_RANK, LAYER_RANK, ApiError, Ctx, as_uuid, control, iso
 
 TERMINAL_RUN = ("COMPLETED", "FAILED", "CANCELLED")
 COVERAGE_STATES = ("PENDING", "COMPLETED_EQUAL", "COMPLETED_DIFFERENT", "INCONCLUSIVE", "ERROR", "UNSUPPORTED",
@@ -84,8 +85,8 @@ def dashboard(ctx: Ctx) -> dict:
     ctl = control(ctx)
     ws = window.window_state(ctx.cfg, ctx.now(), ctl["window_override"])
     db = ctx.db
-    incidents = db.query("""SELECT id, kind, side, severity, message, occurrences, first_seen, last_seen, run_id,
-                                   asset_id, check_kind, scope_key, error_code
+    incidents = db.query("""SELECT id, kind, cluster_id, severity, message, occurrences, first_seen, last_seen,
+                                   run_id, asset_id, check_kind, scope_key, error_code
                             FROM dq_incident WHERE state='OPEN'
                             ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'WARN' THEN 1 ELSE 2 END, last_seen DESC
                             LIMIT 200""")
@@ -115,10 +116,9 @@ def dashboard(ctx: Ctx) -> dict:
     oldest_out = {r["check_kind"]: {"oldest_verified_at": iso(r["oldest"]), "scopes": int(r["scopes"]),
                                     "age_hours": round((now - r["oldest"]).total_seconds() / 3600, 1)}
                   for r in oldest}
-    cancels = {r["side"]: int(r["n"]) for r in db.query(
-        "SELECT side, count(*) AS n FROM dq_attempt WHERE status IN ('CANCEL_REQUESTED','CANCEL_PENDING') GROUP BY 1")}
-    live = {r["side"]: int(r["n"]) for r in db.query(
-        "SELECT side, count(*) AS n FROM dq_attempt WHERE status IN ('LEASED','RUNNING') GROUP BY 1")}
+    cancels = {r["cluster_id"]: int(r["n"]) for r in db.query(
+        """SELECT cluster_id, count(*) AS n FROM dq_attempt
+           WHERE status IN ('CANCEL_REQUESTED','CANCEL_PENDING') GROUP BY 1""")}
     deferred = db.one("SELECT count(*) AS n FROM dq_artifact WHERE purge_state='PURGE_DEFERRED'")["n"]
     gaps = db.one("""SELECT count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM dq_check_rule r WHERE r.asset_id = a.id
                                 AND r.check_kind = 'METRIC' AND r.status = 'APPROVED' AND r.enabled)) AS metric,
@@ -126,12 +126,20 @@ def dashboard(ctx: Ctx) -> dict:
                                 AND r.check_kind = 'SAMPLE' AND r.status = 'APPROVED' AND r.enabled)) AS sample,
                             count(*) AS assets
                      FROM dq_asset a WHERE a.status = 'ACTIVE'""")
+    pool_stats = _cluster_pool_stats(ctx, now)
     clusters = {}
-    for side in SIDES:
-        st = dict((ctl["cluster_state"] or {}).get(side) or {})
-        clusters[side] = {"hard_stop": bool(st.get("hard_stop")), "concurrency": st.get("concurrency"),
-                          "triggers": st.get("triggers") or [], "last_change_at": st.get("last_change_at"),
-                          "running": live.get(side, 0), "cancel_unconfirmed": cancels.get(side, 0)}
+    for cluster_id in ctx.cfg.cluster_ids:
+        st = dict((ctl["cluster_state"] or {}).get(cluster_id) or {})
+        pools = pool_stats[cluster_id]
+        clusters[cluster_id] = {
+            "name": ctx.cfg.cluster(cluster_id)["name"],
+            "hard_stop": bool(st.get("hard_stop")),
+            "triggers": st.get("triggers") or [],
+            "observed_at": st.get("observed_at"),
+            "running": sum(p["live"] for p in pools.values()),
+            "cancel_unconfirmed": cancels.get(cluster_id, 0),
+            "pools": pools,
+        }
     inc = clean(incidents)
     return {
         "now": iso(now),
@@ -153,6 +161,66 @@ def dashboard(ctx: Ctx) -> dict:
         "rule_gaps": {"assets": int(gaps["assets"]), "METRIC": int(gaps["metric"]), "SAMPLE": int(gaps["sample"])},
         "workers": list_workers(ctx),
     }
+
+
+def _cluster_pool_stats(ctx: Ctx, now: _dt.datetime) -> dict:
+    ready = ctx.db.query("""SELECT cluster_id,
+                               CASE WHEN kind='METADATA' THEN 'METADATA' ELSE check_kind END AS claim_kind,
+                               count(*) AS n, min(created_at) AS oldest
+                            FROM dq_work_item WHERE status='READY' GROUP BY 1, 2""")
+    live = ctx.db.query("""SELECT a.cluster_id,
+                              CASE WHEN w.kind='METADATA' THEN 'METADATA' ELSE w.check_kind END AS claim_kind,
+                              count(*) AS n
+                           FROM dq_attempt a JOIN dq_work_item w ON w.id=a.work_item_id
+                           WHERE a.status IN ('LEASED','RUNNING','CANCEL_REQUESTED','CANCEL_PENDING')
+                           GROUP BY 1, 2""")
+    recent = ctx.db.query("""SELECT a.cluster_id,
+                                CASE WHEN w.kind='METADATA' THEN 'METADATA' ELSE w.check_kind END AS claim_kind,
+                                count(*) AS completed,
+                                count(*) FILTER (WHERE a.status='SUCCEEDED') AS succeeded,
+                                count(*) FILTER (WHERE a.error_class='TIMEOUT') AS timed_out,
+                                avg(a.duration_ms) FILTER (WHERE a.duration_ms IS NOT NULL) AS avg_ms,
+                                percentile_cont(0.5) WITHIN GROUP (ORDER BY a.duration_ms)
+                                    FILTER (WHERE a.duration_ms IS NOT NULL) AS p50_ms,
+                                percentile_cont(0.95) WITHIN GROUP (ORDER BY a.duration_ms)
+                                    FILTER (WHERE a.duration_ms IS NOT NULL) AS p95_ms,
+                                max(a.duration_ms) AS max_ms
+                             FROM dq_attempt a JOIN dq_work_item w ON w.id=a.work_item_id
+                             WHERE a.finished_at >= %s AND a.status IN ('SUCCEEDED','FAILED')
+                             GROUP BY 1, 2""", (now - _dt.timedelta(hours=1),))
+    ready_by = {(r["cluster_id"], r["claim_kind"]): r for r in ready}
+    live_by = {(r["cluster_id"], r["claim_kind"]): r for r in live}
+    recent_by = {(r["cluster_id"], r["claim_kind"]): r for r in recent}
+    out = {}
+    for cluster_id in ctx.cfg.cluster_ids:
+        pools = {}
+        for kind in POOL_KINDS:
+            q = ready_by.get((cluster_id, kind))
+            active = live_by.get((cluster_id, kind))
+            done = recent_by.get((cluster_id, kind))
+            queued = int(q["n"]) if q else 0
+            running = int(active["n"]) if active else 0
+            completed = int(done["completed"]) if done else 0
+            success = int(done["succeeded"]) if done else 0
+            timed_out = int(done["timed_out"]) if done else 0
+            pools[kind] = {
+                "limit": ctx.cfg.concurrency(cluster_id, kind),
+                "ready": queued,
+                "oldest_ready_at": iso(q["oldest"]) if q else None,
+                "oldest_ready_age_seconds": max(0, int((now - q["oldest"]).total_seconds())) if q else None,
+                "live": running,
+                "completed_last_hour": completed,
+                "rate_per_hour": completed,
+                "avg_ms": round(float(done["avg_ms"]), 1) if done and done["avg_ms"] is not None else None,
+                "p50_ms": round(float(done["p50_ms"]), 1) if done and done["p50_ms"] is not None else None,
+                "p95_ms": round(float(done["p95_ms"]), 1) if done and done["p95_ms"] is not None else None,
+                "max_ms": int(done["max_ms"]) if done and done["max_ms"] is not None else None,
+                "success_rate": success / completed if completed else None,
+                "timeout_rate": timed_out / completed if completed else None,
+                "eta_hours": round((queued + running) / completed, 2) if completed else None,
+            }
+        out[cluster_id] = pools
+    return out
 
 
 def _run_progress(ctx: Ctx, run_ids: list) -> dict:
@@ -188,6 +256,10 @@ def list_assets(ctx: Ctx, params: dict) -> dict:
     if status:
         where.append("a.status = %(status)s")
         args["status"] = status
+    pair_id = _enum(params.get("pair_id"), {p["id"] for p in ctx.cfg["cluster_pairs"]}, "pair_id")
+    if pair_id:
+        where.append("a.pair_id = %(pair_id)s")
+        args["pair_id"] = pair_id
     if params.get("q"):
         where.append("(a.source_db || '.' || a.source_table ILIKE %(q)s OR a.target_db || '.' || a.target_table "
                      "ILIKE %(q)s)")
@@ -197,8 +269,8 @@ def list_assets(ctx: Ctx, params: dict) -> dict:
         where.append("a.status = 'ACTIVE' AND NOT EXISTS (SELECT 1 FROM dq_check_rule r WHERE r.asset_id = a.id "
                      "AND r.check_kind = %(missing)s AND r.status = 'APPROVED' AND r.enabled)")
         args["missing"] = missing
-    rows = ctx.db.query(f"""SELECT a.id, a.layer, a.source_db, a.source_table, a.target_db, a.target_table,
-                                   a.priority, a.enabled, a.status, a.revision, a.updated_at,
+    rows = ctx.db.query(f"""SELECT a.id, a.pair_id, a.layer, a.source_db, a.source_table, a.target_db,
+                                   a.target_table, a.priority, a.enabled, a.status, a.revision, a.updated_at,
                                    (SELECT count(*) FROM dq_check_rule r WHERE r.asset_id = a.id
                                       AND r.status = 'APPROVED') AS approved_rules,
                                    (SELECT count(*) FROM dq_check_rule r WHERE r.asset_id = a.id
@@ -215,6 +287,7 @@ def get_asset(ctx: Ctx, asset_id) -> dict:
     aid = as_uuid(asset_id, "asset_id")
     a = _one(ctx, "SELECT * FROM dq_asset WHERE id=%s", (aid,), "asset")
     out = clean(a)
+    out["pair"] = clean(ctx.cfg.pair(a["pair_id"]))
     out["rules"] = asset_rules(ctx, aid)
     out["slot"] = clean(ctx.db.one("SELECT run_id, state, acquired_at FROM dq_asset_slot WHERE asset_id=%s", (aid,)))
     out["scope_entries"] = clean(ctx.db.query(
@@ -483,9 +556,9 @@ def get_comparison(ctx: Ctx, comparison_id) -> dict:
     out["statement"] = {"common_snapshot": "NONE", "read_mode": c["read_mode"],
                         "note": "两端为在线读取，没有共同快照；差异可能来自在线写入时差"}
     out["side_results"] = clean(ctx.db.query(
-        """SELECT id, side, evidence, row_count, total_bytes, validity, read_started, read_finished, query_ref,
-                  accepted_at, raw_purged_at
-           FROM dq_side_result WHERE id = ANY(%s) ORDER BY side""",
+        """SELECT id, cluster_id, evidence, row_count, total_bytes, validity, read_started, read_finished,
+                  query_ref, accepted_at, raw_purged_at
+           FROM dq_side_result WHERE id = ANY(%s) ORDER BY cluster_id""",
         (list(c["source_result_ids"]) + list(c["target_result_ids"]),)))
     out["history"] = clean(ctx.db.query(
         """SELECT id, verdict, difference_count, compared_at, run_id FROM dq_comparison
@@ -528,13 +601,13 @@ def list_incidents(ctx: Ctx, params: dict) -> dict:
     if params.get("kind"):
         where.append("kind = %(kind)s")
         args["kind"] = str(params["kind"])
-    side = _enum(params.get("side"), SIDES, "side")
-    if side:
-        where.append("side = %(side)s")
-        args["side"] = side
-    rows = ctx.db.query(f"""SELECT id, kind, dedup_key, side, severity, state, message, occurrences, first_seen,
-                                   last_seen, run_id, asset_id, rule_key, check_kind, scope_key, error_code, detail,
-                                   count(*) OVER () AS _total
+    cluster_id = _enum(params.get("cluster_id"), ctx.cfg.cluster_ids, "cluster_id")
+    if cluster_id:
+        where.append("cluster_id = %(cluster_id)s")
+        args["cluster_id"] = cluster_id
+    rows = ctx.db.query(f"""SELECT id, kind, dedup_key, cluster_id, severity, state, message, occurrences,
+                                   first_seen, last_seen, run_id, asset_id, rule_key, check_kind, scope_key,
+                                   error_code, detail, count(*) OVER () AS _total
                             FROM dq_incident WHERE {' AND '.join(where)} ORDER BY last_seen DESC
                             LIMIT %(limit)s OFFSET %(offset)s""", args)
     return _paged(rows, page, size)
@@ -563,14 +636,14 @@ def list_audit(ctx: Ctx, params: dict) -> dict:
 
 
 def list_workers(ctx: Ctx) -> list[dict]:
-    rows = ctx.db.query("""SELECT w.id, w.name, w.side, w.execution_location, w.status, w.created_at,
+    rows = ctx.db.query("""SELECT w.id, w.name, w.cluster_id, w.execution_location, w.status, w.created_at,
                                   r.id AS registration_id, r.status AS registration_status, r.registered_at,
                                   r.last_heartbeat_at, r.capabilities->>'sr_version' AS sr_version,
                                   r.capabilities->'s1'->>'status' AS s1_status, r.stats
                            FROM dq_worker w LEFT JOIN LATERAL (
                                SELECT * FROM dq_worker_registration x WHERE x.worker_id = w.id
                                ORDER BY x.registered_at DESC LIMIT 1) r ON true
-                           ORDER BY w.side, w.name""")
+                           ORDER BY w.cluster_id, w.name""")
     return clean(rows)
 
 

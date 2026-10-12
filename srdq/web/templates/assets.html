@@ -2,6 +2,7 @@
 {% import "macros.html" as m with context %}
 {% block content %}
 <form method="get" class="filters">
+  <select name="pair_id"><option value="">全部校验组</option>{% for p in PAIRS %}<option value="{{ p.id }}"{% if query.pair_id == p.id %} selected{% endif %}>{{ p.name }}（{{ p.id }}）</option>{% endfor %}</select>
   <select name="layer"><option value="">全部层级</option>{% for l in LAYERS %}<option{% if query.layer == l %} selected{% endif %}>{{ l }}</option>{% endfor %}</select>
   <select name="status"><option value="">全部状态</option>{% for s in ["ACTIVE", "ARCHIVED"] %}<option{% if query.status == s %} selected{% endif %}>{{ s }}</option>{% endfor %}</select>
   <select name="missing_kind"><option value="">规则齐全与否不限</option>{% for k in ["METRIC", "SAMPLE"] %}<option value="{{ k }}"{% if query.missing_kind == k %} selected{% endif %}>无 {{ k }} 规则</option>{% endfor %}</select>
@@ -10,16 +11,16 @@
   <a href="/imports">导入资产名单 / 规则模板</a>
 </form>
 <table>
-  <tr><th>层级</th><th>源表（huawei）</th><th>目标表（aliyun）</th><th>优先级</th><th>启用</th><th>状态</th><th>已批准规则</th><th>待批准</th></tr>
+  <tr><th>校验组</th><th>层级</th><th>源表</th><th>目标表</th><th>优先级</th><th>启用</th><th>状态</th><th>已批准规则</th><th>待批准</th></tr>
   {% for a in data["items"] %}
   <tr>
-    <td>{{ a.layer }}</td>
+    <td>{{ a.pair_id }}</td><td>{{ a.layer }}</td>
     <td><a href="/assets/{{ a.id }}">{{ a.source_db }}.{{ a.source_table }}</a></td>
     <td>{{ a.target_db }}.{{ a.target_table }}</td>
     <td>{{ a.priority }}</td><td>{{ "是" if a.enabled else "否" }}</td><td>{{ m.badge(a.status) }}</td>
     <td>{{ a.approved_rules }}</td><td>{% if a.draft_rules %}<a href="/rules?status=DRAFT&q={{ a.source_db }}.{{ a.source_table }}">{{ a.draft_rules }}</a>{% else %}0{% endif %}</td>
   </tr>
-  {% else %}<tr><td colspan="8" class="muted">没有资产</td></tr>{% endfor %}
+  {% else %}<tr><td colspan="9" class="muted">没有资产</td></tr>{% endfor %}
 </table>
 {{ m.pager(data) }}
 {% endblock %}

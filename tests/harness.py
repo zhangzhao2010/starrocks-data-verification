@@ -18,7 +18,7 @@ from srdq.executor.client import WorkerClient
 from srdq.executor.runner import Executor
 
 TZ = ZoneInfo("Asia/Shanghai")
-ASSET_HEADER = "layer,source_db,source_table,target_db,target_table,priority,enabled\n"
+ASSET_HEADER = "layer,pair_id,source_db,source_table,target_db,target_table,priority,enabled\n"
 
 
 def _hhmm(t: _dt.datetime) -> str:
@@ -48,21 +48,23 @@ class Harness:
         self.ctx = Ctx(self.cfg, db, self.clock)
         ensure_control(self.ctx)
         self.app = create_app(self.ctx)
-        self.adapters = {s: SimAdapter(s, self.root / f"sr_{s}") for s in ("huawei", "aliyun")}
+        self.adapters = {cluster_id: SimAdapter(cluster_id, self.root / f"sr_{cluster_id}")
+                         for cluster_id in self.cfg.cluster_ids}
         self.executors: dict[str, Executor] = {}
-        for side in ("huawei", "aliyun"):
-            w = queue.create_worker(self.ctx, f"w-{side}", side)
+        for cluster_id in self.cfg.cluster_ids:
+            w = queue.create_worker(self.ctx, f"w-{cluster_id}", cluster_id)
             client = WorkerClient("http://testserver", w["token"])
             client._http = TestClient(self.app, base_url="http://testserver",
                                       headers={"Authorization": f"Bearer {w['token']}"})
-            ex = Executor(self.cfg, side, self.adapters[side], client, self.root / f"ex_{side}")
+            ex = Executor(self.cfg, cluster_id, self.adapters[cluster_id], client, self.root / f"ex_{cluster_id}")
             ex.poll_seconds = 0.05
-            self.executors[side] = ex
+            self.executors[cluster_id] = ex
             ex.register()
 
     def close(self) -> None:
         for ex in self.executors.values():
-            ex._pool.shutdown(wait=True)
+            for pool in ex._pools.values():
+                pool.shutdown(wait=True)
             ex.outbox.close()
             ex.client.close()
 
@@ -112,8 +114,9 @@ class Harness:
             ex.heartbeat_once()
 
     # ---- setup flows -----------------------------------------------------------------
-    def import_assets(self, lines: list[str]) -> dict:
-        data = (ASSET_HEADER + "\n".join(lines) + "\n").encode("utf-8")
+    def import_assets(self, lines: list[str], pair_id: str = "legacy") -> dict:
+        rows = [line.split(",", 1)[0] + f",{pair_id}," + line.split(",", 1)[1] for line in lines]
+        data = (ASSET_HEADER + "\n".join(rows) + "\n").encode("utf-8")
         pv = importer.preview_assets(self.ctx, "assets.csv", data)
         return importer.confirm_import(self.ctx, pv["id"], reason="test import")
 
@@ -131,7 +134,9 @@ class Harness:
         return {"discovery": d, "manifest_id": str(m["id"])}
 
     def import_rules(self, kind: str, header: list[str], lines: list[str], approve: bool = True) -> dict:
-        data = (",".join(header) + "\n" + "\n".join(lines) + "\n").encode("utf-8")
+        full_header = ["pair_id", *header]
+        rows = [f"legacy,{line}" for line in lines]
+        data = (",".join(full_header) + "\n" + "\n".join(rows) + "\n").encode("utf-8")
         fn = importer.preview_metric_rules if kind == "METRIC" else importer.preview_sample_rules
         pv = fn(self.ctx, f"{kind.lower()}.csv", data)
         res = importer.confirm_import(self.ctx, pv["id"], reason="test rules")

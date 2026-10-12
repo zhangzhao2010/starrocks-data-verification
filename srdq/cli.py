@@ -16,7 +16,6 @@ from . import config
 log = logging.getLogger("srdq")
 
 DEFAULT_CONFIG = "/etc/srdq/config.yaml"
-SIDES = ("huawei", "aliyun")
 
 
 class CliError(SystemExit):
@@ -86,11 +85,18 @@ def pg_dsn(cfg) -> str:
 
 
 def refuse_sr_credentials(cfg, dev: bool) -> None:
-    """Controller and Web must not be able to read either side's SR credentials (side isolation)."""
-    readable = [s for s in SIDES if os.access(cfg["credentials"][s]["file"], os.R_OK)]
+    """Controller and Web must not be able to read any StarRocks credential file."""
+    readable = [c["id"] for c in cfg["physical_clusters"] if os.access(c["credential_file"], os.R_OK)]
     if readable and not dev:
-        raise CliError(f"this OS user can read the SR credential file(s) of {readable}; run the controller and web "
+        raise CliError(f"this OS user can read the SR credential file(s) for {readable}; run the controller and web "
                        "as srdq-ctl (or pass --dev on a development machine)")
+
+
+def cluster_config(cfg, cluster_id: str) -> dict:
+    try:
+        return cfg.cluster(cluster_id)
+    except StopIteration as e:
+        raise CliError(f"unknown cluster id {cluster_id!r}; expected one of {list(cfg.cluster_ids)}") from e
 
 
 def make_ctx(cfg, *, max_connections: int = 8):
@@ -140,9 +146,10 @@ def cmd_check_config(args) -> None:
            "window": f"{w['open_at']}-{w['drain_at']}-{w['close_at']} {w['timezone']}",
            "web": f"{cfg['web']['bind_address']}:{cfg['web']['port']}",
            "worker_api": f"{cfg['controller']['worker_api_bind']}:{cfg['controller']['worker_api_port']}",
-           "credentials": {}}
-    for name in (*SIDES, "controller_pg"):
-        f = cfg["credentials"][name]["file"]
+           "cluster_pairs": cfg["cluster_pairs"], "credentials": {}}
+    files = [(c["id"], c["credential_file"]) for c in cfg["physical_clusters"]]
+    files.append(("controller_pg", cfg["credentials"]["controller_pg"]["file"]))
+    for name, f in files:
         try:
             st = Path(f).stat()
             mode = oct(stat.S_IMODE(st.st_mode))
@@ -201,7 +208,7 @@ def _executor_token(args, creds: dict | None) -> str:
     else:
         tok = str((creds or {}).get("worker_token") or "").strip()
     if not tok:
-        raise CliError("no worker token: put \"worker_token\" in the side credential file or pass --token-file")
+        raise CliError("no worker token: put \"worker_token\" in the cluster credential file or pass --token-file")
     return tok
 
 
@@ -210,23 +217,25 @@ def cmd_executor(args) -> None:
     from .executor.runner import Executor
 
     cfg = load_config(args)
-    side = args.side
-    other = next(s for s in SIDES if s != side)
-    if os.access(cfg["credentials"][other]["file"], os.R_OK) and not args.dev:
-        raise CliError(f"the {side} executor can read the {other} credential file; run it as "
-                       f"{cfg['credentials'][side]['os_user']}")
+    cluster_id = args.cluster_id
+    cluster = cluster_config(cfg, cluster_id)
+    readable_others = [c["id"] for c in cfg["physical_clusters"] if c["id"] != cluster_id
+                       and os.access(c["credential_file"], os.R_OK)]
+    if readable_others and not args.dev:
+        raise CliError(f"the {cluster_id} executor can read credential files for {readable_others}; run it as "
+                       f"{cluster['os_user']}")
     creds = None
     if args.sim:
         from .executor.adapter.sim import SimAdapter
 
-        adapter = SimAdapter(side, Path(args.sim))
+        adapter = SimAdapter(cluster_id, Path(args.sim))
     else:
         from .executor.adapter.starrocks import CredentialError, StarRocksAdapter
 
-        cred_file = _private_file(cfg["credentials"][side]["file"], f"{side} credential file")
-        creds = _read_json(cred_file, f"{side} credential file")
+        cred_file = _private_file(cluster["credential_file"], f"{cluster_id} credential file")
+        creds = _read_json(cred_file, f"{cluster_id} credential file")
         try:
-            adapter = StarRocksAdapter(side, cred_file,
+            adapter = StarRocksAdapter(cluster_id, cred_file,
                                        storage_patterns=cfg["error_classification"]["storage_suspect_patterns"],
                                        read_timeout=int(cfg["execution"]["read_timeout_seconds"]))
         except CredentialError as e:
@@ -234,13 +243,14 @@ def cmd_executor(args) -> None:
     token = _executor_token(args, creds)
     creds = None
     client = WorkerClient(cfg["executor"]["controller_url"], token)
-    data_dir = Path(args.data_dir or cfg["executor"]["data_dir"]) / side
+    data_dir = Path(args.data_dir or cfg["executor"]["data_dir"]) / cluster_id
     data_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(data_dir, 0o700)
-    ex = Executor(cfg, side, adapter, client, data_dir)
+    ex = Executor(cfg, cluster_id, adapter, client, data_dir)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: ex.request_stop())
-    log.info("executor side=%s controller=%s data_dir=%s", side, cfg["executor"]["controller_url"], data_dir)
+    log.info("executor cluster_id=%s controller=%s data_dir=%s", cluster_id,
+             cfg["executor"]["controller_url"], data_dir)
     ex.run_forever()
 
 
@@ -251,7 +261,8 @@ def cmd_worker_token(args) -> None:
     if args.action == "disable":
         _print(_api(queue.disable_worker, ctx, args.name, reason=args.reason))
         return
-    out = _api(queue.create_worker, ctx, args.name, args.side, execution_location=args.location,
+    cluster_config(ctx.cfg, args.cluster_id)
+    out = _api(queue.create_worker, ctx, args.name, args.cluster_id, execution_location=args.location,
                rotate=args.rotate)
     token = out.pop("token")
     if args.out:
@@ -262,7 +273,7 @@ def cmd_worker_token(args) -> None:
         _print(out)
     else:
         _print(out)
-        print("\nworker token (shown once, store it as \"worker_token\" in the side credential file):",
+        print("\nworker token (shown once, store it as \"worker_token\" in the cluster credential file):",
               file=sys.stderr)
         print(token)
 
@@ -337,7 +348,7 @@ def cmd_status(args) -> None:
 # ---- parser --------------------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="srdq", description="StarRocks dual-cloud data verification")
+    p = argparse.ArgumentParser(prog="srdq", description="StarRocks multi-cluster data verification")
     p.add_argument("--config", help=f"config file (default: $SRDQ_CONFIG or {DEFAULT_CONFIG})")
     p.add_argument("--log-level", default=os.environ.get("SRDQ_LOG_LEVEL", "INFO"))
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -351,20 +362,20 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--dev", action="store_true", help="skip the SR credential isolation check")
         sp.set_defaults(fn=fn)
 
-    sp = sub.add_parser("executor", help="run one side's executor")
-    sp.add_argument("--side", required=True, choices=SIDES)
+    sp = sub.add_parser("executor", help="run one physical cluster's executor")
+    sp.add_argument("--cluster-id", required=True)
     sp.add_argument("--token-file", help="0600 file holding the worker token (default: worker_token in the "
-                                         "side credential file)")
+                                         "cluster credential file)")
     sp.add_argument("--data-dir", help="override executor.data_dir")
     sp.add_argument("--sim", metavar="DIR", help="use a simulated SR cluster stored in DIR (development only)")
-    sp.add_argument("--dev", action="store_true", help="skip the cross-side credential isolation check")
+    sp.add_argument("--dev", action="store_true", help="skip the cross-cluster credential isolation check")
     sp.set_defaults(fn=cmd_executor)
 
     sp = sub.add_parser("worker-token", help="create, rotate or disable an executor identity")
     wt = sp.add_subparsers(dest="action", required=True)
     c = wt.add_parser("create")
     c.add_argument("--name", required=True)
-    c.add_argument("--side", required=True, choices=SIDES)
+    c.add_argument("--cluster-id", required=True)
     c.add_argument("--location", default="ALIYUN_ECS", help="physical location (default ALIYUN_ECS)")
     c.add_argument("--rotate", action="store_true", help="issue a new token for an existing worker")
     c.add_argument("--out", help="write the token to this new 0600 file instead of stdout")
