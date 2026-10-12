@@ -7,3 +7,4 @@ dist/
 build/
 *.egg-info/
 deploy/secrets/*.json
+table_info/

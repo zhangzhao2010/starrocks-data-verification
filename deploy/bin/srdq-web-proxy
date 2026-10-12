@@ -1,0 +1,171 @@
+#!/opt/srdq/current/venv/bin/python
+"""Reverse proxy that exposes the loopback-only srdq web on an ECS private address, optionally behind Basic Auth.
+
+Serve:  SRDQ_PROXY_LISTEN=10.0.0.5:8080 SRDQ_PROXY_USERS=<entries> srdq-web-proxy
+        SRDQ_PROXY_LISTEN=10.0.0.5:8080 SRDQ_PROXY_AUTH=none srdq-web-proxy   (no login)
+Hash:   srdq-web-proxy hash-password <user>   (prints one SRDQ_PROXY_USERS entry)
+"""
+import asyncio
+import base64
+import binascii
+import getpass
+import hashlib
+import hmac
+import logging
+import os
+import secrets
+import sys
+from urllib.parse import urlsplit
+
+import httpx
+import uvicorn
+from starlette.background import BackgroundTask
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response, StreamingResponse
+
+log = logging.getLogger("srdq.web-proxy")
+
+ITERATIONS = 600_000
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
+              "transfer-encoding", "upgrade"}
+STRIPPED_REQUEST = HOP_BY_HOP | {"host", "authorization", "origin", "referer"}
+
+
+def hash_password(user: str, password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, ITERATIONS)
+    return f"{user}:{ITERATIONS}:{salt.hex()}:{digest.hex()}"
+
+
+def parse_users(raw: str) -> dict[str, tuple[int, bytes, bytes]]:
+    users = {}
+    for entry in filter(None, (e.strip() for e in raw.split(","))):
+        try:
+            user, iterations, salt, digest = entry.split(":")
+            users[user] = (int(iterations), bytes.fromhex(salt), bytes.fromhex(digest))
+        except ValueError:
+            raise SystemExit(f"SRDQ_PROXY_USERS has a malformed entry starting with {entry.split(':')[0]!r}")
+    if not users:
+        raise SystemExit("SRDQ_PROXY_USERS is empty; generate entries with: srdq-web-proxy hash-password <user>")
+    return users
+
+
+class Proxy:
+    def __init__(self, upstream: str, origins: set[str], users: dict[str, tuple[int, bytes, bytes]] | None):
+        self.upstream = upstream.rstrip("/")
+        self.upstream_host = urlsplit(upstream).netloc
+        self.origins = origins
+        self.users = users
+        self.verified: dict[str, str] = {}
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=5))
+
+    def _check_password(self, user: str, password: str) -> bool:
+        if user not in self.users:
+            return False
+        iterations, salt, digest = self.users[user]
+        return hmac.compare_digest(hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations), digest)
+
+    async def authenticate(self, header: str) -> str | None:
+        if header in self.verified:
+            return self.verified[header]
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "basic":
+            return None
+        try:
+            user, sep, password = base64.b64decode(token, validate=True).decode().partition(":")
+        except (binascii.Error, UnicodeDecodeError):
+            return None
+        if not sep or not await asyncio.to_thread(self._check_password, user, password):
+            return None
+        self.verified[header] = user
+        return user
+
+    def same_origin(self, request: Request) -> bool:
+        if request.headers.get("sec-fetch-site") == "cross-site":
+            return False
+        origin = request.headers.get("origin")
+        if origin is None and (referer := request.headers.get("referer")) is not None:
+            u = urlsplit(referer)
+            origin = f"{u.scheme}://{u.netloc}"
+        return origin is None or origin.lower() in self.origins
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return
+        request = Request(scope, receive)
+        response = await self.handle(request)
+        await response(scope, receive, send)
+
+    async def handle(self, request: Request) -> Response:
+        if self.users is None:
+            user = "anonymous"
+        elif (user := await self.authenticate(request.headers.get("authorization", ""))) is None:
+            return PlainTextResponse("authentication required\n", status_code=401,
+                                     headers={"WWW-Authenticate": 'Basic realm="srdq", charset="UTF-8"'})
+        if request.method not in SAFE_METHODS:
+            if not self.same_origin(request):
+                log.warning("cross-origin %s %s rejected for %s", request.method, request.url.path, user)
+                return PlainTextResponse("cross-origin write rejected\n", status_code=403)
+            log.info("%s %s %s by %s", request.client.host if request.client else "-", request.method,
+                     request.url.path, user)
+        headers = [(k, v) for k, v in request.headers.items() if k.lower() not in STRIPPED_REQUEST]
+        headers.append(("host", self.upstream_host))
+        url = self.upstream + request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        upstream_request = self.client.build_request(request.method, url, headers=headers,
+                                                     content=request.stream())
+        try:
+            upstream = await self.client.send(upstream_request, stream=True)
+        except httpx.HTTPError as exc:
+            log.error("upstream %s unreachable: %s", self.upstream, exc)
+            return PlainTextResponse("srdq web is unreachable\n", status_code=502)
+        response = StreamingResponse(upstream.aiter_raw(), status_code=upstream.status_code,
+                                     background=BackgroundTask(upstream.aclose))
+        response.raw_headers = [(k.encode("latin-1"), v.encode("latin-1"))
+                                for k, v in upstream.headers.multi_items() if k.lower() not in HOP_BY_HOP]
+        return response
+
+
+def serve() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    listen = os.environ.get("SRDQ_PROXY_LISTEN", "")
+    host, _, port = listen.rpartition(":")
+    if not host or not port.isdigit():
+        raise SystemExit("SRDQ_PROXY_LISTEN must be <ECS private IP>:<port>, e.g. 10.0.0.5:8080")
+    origins = {o.strip().rstrip("/").lower() for o in os.environ.get("SRDQ_PROXY_ORIGINS", "").split(",") if o.strip()}
+    if not origins:
+        if host in ("0.0.0.0", "::", "[::]"):
+            raise SystemExit("listening on a wildcard address requires SRDQ_PROXY_ORIGINS")
+        origins = {f"http://{listen}".lower()}
+    auth = os.environ.get("SRDQ_PROXY_AUTH", "basic").strip().lower()
+    if auth not in ("basic", "none"):
+        raise SystemExit("SRDQ_PROXY_AUTH must be 'basic' (default) or 'none'")
+    users = parse_users(os.environ.get("SRDQ_PROXY_USERS", "")) if auth == "basic" else None
+    proxy = Proxy(os.environ.get("SRDQ_PROXY_UPSTREAM", "http://127.0.0.1:8470"), origins, users)
+    log.info("proxying %s -> %s, auth: %s, allowed origins: %s", listen, proxy.upstream, auth,
+             ", ".join(sorted(origins)))
+    if users is None:
+        log.warning("SRDQ_PROXY_AUTH=none: anyone who can reach %s can operate srdq", listen)
+    uvicorn.run(proxy, host=host.strip("[]"), port=int(port), lifespan="off", proxy_headers=False,
+                server_header=False, date_header=False, log_config=None)
+
+
+def main() -> None:
+    if sys.argv[1:2] == ["hash-password"]:
+        if len(sys.argv) != 3 or ":" in sys.argv[2] or "," in sys.argv[2]:
+            raise SystemExit("usage: srdq-web-proxy hash-password <user>   (user must not contain ':' or ',')")
+        password = getpass.getpass("password: ")
+        if len(password) < 12:
+            raise SystemExit("password must be at least 12 characters")
+        if getpass.getpass("again: ") != password:
+            raise SystemExit("passwords do not match")
+        print(hash_password(sys.argv[2], password))
+    elif len(sys.argv) == 1:
+        serve()
+    else:
+        raise SystemExit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

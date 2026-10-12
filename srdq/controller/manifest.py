@@ -77,12 +77,6 @@ def _bound(lt: str, v: Any, lower: bool) -> str | None:
         raise
 
 
-def _covers(plo, phi, a, b, key) -> bool:
-    lo_ok = plo is None or (a is not None and key(plo) <= key(a))
-    hi_ok = phi is None or (b is not None and key(b) <= key(phi))
-    return lo_ok and hi_ok
-
-
 def _range_entries(col: str, lt: str, src: dict, tgt: dict) -> list[dict] | None:
     key = lambda v: dsl.sort_key(lt, v)  # noqa: E731
     sides = []
@@ -100,13 +94,22 @@ def _range_entries(col: str, lt: str, src: dict, tgt: dict) -> list[dict] | None
             for v in (lo, hi):
                 if v is not None:
                     points.setdefault(key(v), v)
-    pts = [points[k] for k in sorted(points)]
+    order = sorted(points)
+    pts = [points[k] for k in order]
     intervals = [(None, pts[0] if pts else None)] + list(zip(pts, pts[1:])) + [(pts[-1] if pts else None, None)]
+    # Interval i spans (pts[i-1], pts[i]); a partition [lo, hi) covers intervals idx(lo)+1 .. idx(hi).
+    idx = {k: i for i, k in enumerate(order)}
+    last = len(intervals) - 1
+    covers: list[list[list]] = [[[] for _ in intervals] for _ in sides]
+    for si, parts in enumerate(sides):
+        for lo, hi, n in parts:
+            start = 0 if lo is None else idx[key(lo)] + 1
+            end = last if hi is None else idx[key(hi)]
+            for i in range(start, end + 1):
+                covers[si][i].append(n)
     out = []
-    for a, b in intervals:
-        if a is not None and b is not None and key(a) >= key(b):
-            continue
-        cover = [[n for lo, hi, n in parts if _covers(lo, hi, a, b, key)] for parts in sides]
+    for i, (a, b) in enumerate(intervals):
+        cover = [covers[0][i], covers[1][i]]
         pred = [dsl.scope_range(col, lt, a, b)]
         phys = {"source": cover[0], "target": cover[1]}
         ps = "PRESENT" if cover[0] else "ABSENT_CONFIRMED"
@@ -257,14 +260,14 @@ def build_draft(cur, ctx: Ctx, run_id) -> dict:
                 (mid, version, complete, jb(inventory), digest_json({"inventory": inventory, "entries": all_entries}),
                  run_id, base["id"] if base else None, jb(summary)))
     for aid, entries in all_entries.items():
-        for e in entries:
-            cur.execute("""INSERT INTO dq_scope_entry (id, manifest_id, asset_id, scope_kind, scope_key,
+        cur.executemany("""INSERT INTO dq_scope_entry (id, manifest_id, asset_id, scope_kind, scope_key,
                            scope_key_digest, label, predicate, presence_source, presence_target, expected_reason,
                            status, status_reason, is_new, physical) VALUES
                            (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (new_id(), mid, aid, e["scope_kind"], e["scope_key"], dsl.scope_digest(e["predicate"]),
-                         e["label"][:500], jb(e["predicate"]), e["presence_source"], e["presence_target"],
-                         e["expected_reason"], e["status"], e["status_reason"], e["is_new"], jb(e["physical"])))
+                        [(new_id(), mid, aid, e["scope_kind"], e["scope_key"], dsl.scope_digest(e["predicate"]),
+                          e["label"][:500], jb(e["predicate"]), e["presence_source"], e["presence_target"],
+                          e["expected_reason"], e["status"], e["status_reason"], e["is_new"], jb(e["physical"]))
+                         for e in entries])
     audit(cur, "MANIFEST_DRAFTED", "manifest", mid, {"version": version, "summary": summary})
     out = {"id": str(mid), "version": version, "inventory_complete": complete, "summary": summary,
            "auto_confirmed": False}

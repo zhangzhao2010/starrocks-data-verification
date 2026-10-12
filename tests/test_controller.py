@@ -316,3 +316,20 @@ def test_recovery_mode(h):
                                reason="checked")
     assert h.ctx.db.one("SELECT status FROM dq_control_state WHERE id=1")["status"] == "ACTIVE"
     assert "window" in h.tick()
+
+
+def test_range_scopes_scale_linearly_with_partitions():
+    import time
+
+    from srdq.controller import manifest
+
+    d0 = _dt.date(2000, 1, 1)
+    parts = [{"name": f"p{i}", "lower": str(d0 + _dt.timedelta(i)), "upper": str(d0 + _dt.timedelta(i + 1))}
+             for i in range(20000)]
+    t0 = time.monotonic()
+    out = manifest._range_entries("dt", "DATE", {"partitions": parts}, {"partitions": parts[1:]})
+    assert time.monotonic() - t0 < 5
+    assert len(out) == 20002
+    assert out[1]["expected_reason"] == "SOURCE_ONLY" and out[1]["physical"] == {"source": ["p0"], "target": []}
+    assert out[2]["expected_reason"] == "IN_SCOPE" and out[2]["physical"] == {"source": ["p1"], "target": ["p1"]}
+    assert out[0]["expected_reason"] == out[-1]["expected_reason"] == "OUTSIDE"
