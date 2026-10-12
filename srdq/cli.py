@@ -346,7 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
         fn=cmd_check_config)
     sub.add_parser("migrate", help="apply pending schema migrations").set_defaults(fn=cmd_migrate)
     for name, fn, help_ in (("controller", cmd_controller, "tick loop + executor-facing API (127.0.0.1:8471)"),
-                            ("web", cmd_web, "dashboard and REST API (127.0.0.1:8470)")):
+                            ("web", cmd_web, "dashboard and REST API (0.0.0.0:8470)")):
         sp = sub.add_parser(name, help=help_)
         sp.add_argument("--dev", action="store_true", help="skip the SR credential isolation check")
         sp.set_defaults(fn=fn)

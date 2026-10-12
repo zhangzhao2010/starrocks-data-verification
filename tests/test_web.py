@@ -52,30 +52,17 @@ def html_ok(resp) -> str:
 
 # ---- security ----------------------------------------------------------------------------------------
 
-def test_host_rejected(web):
-    r = web.get("/", headers={"Host": "evil.example.com"})
-    assert r.status_code == 403 and r.json()["code"] == "HOST_REJECTED"
-    r = web.get("/v1/health", headers={"Host": "10.0.0.5:8470"})
-    assert r.status_code == 403
-
-
-def test_loopback_hosts_accepted(web):
-    for host in ("127.0.0.1:8470", "localhost:18470", "[::1]:8470", "localhost"):
+def test_any_host_accepted(web):
+    for host in ("127.0.0.1:8470", "localhost", "[::1]:8470", "10.0.0.5:8470", "srdq.example.com"):
         assert web.get("/v1/health", headers={"Host": host}).status_code == 200, host
 
 
-def test_cross_origin_write_rejected(web):
-    body = {"reason": "x"}
-    r = web.post("/v1/recovery", json=body, headers={"Origin": "http://evil.example.com"})
-    assert r.status_code == 403 and r.json()["code"] == "ORIGIN_REJECTED"
-    r = web.post("/v1/recovery", json=body, headers={"Origin": "http://localhost:8470"})
-    assert r.status_code == 403, "different host:port from the request Host is cross-origin"
-    r = web.post("/v1/recovery", json=body, headers={"Sec-Fetch-Site": "cross-site", **ORIGIN})
-    assert r.status_code == 403
-    r = web.post("/v1/recovery", json=body, headers={"Referer": "http://evil.example.com/x"})
-    assert r.status_code == 403
-    r = web.post("/actions/recovery", data={"reason": "x"}, headers={"Origin": "null"})
-    assert r.status_code == 403
+def test_writes_from_instance_ip_accepted(web):
+    origin = "http://10.0.0.5:8470"
+    r = web.post("/v1/recovery", json={"reason": "x"}, headers={"Host": "10.0.0.5:8470", "Origin": origin})
+    assert r.status_code not in (401, 403), r.text
+    r = web.post("/actions/recovery", data={"reason": "x"}, headers={"Origin": "http://other.example.com"})
+    assert r.status_code not in (401, 403), r.text
 
 
 def test_security_headers(web):

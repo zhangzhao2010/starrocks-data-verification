@@ -18,7 +18,7 @@
 | 进程 | 系统用户 | 作用 |
 |---|---|---|
 | `srdq controller` | srdq-ctl | 调度循环，以及面向执行器的 API（127.0.0.1:8471）。负责写 PG 控制库、比较结果、生成报告 |
-| `srdq web` | srdq-ctl | 看板和 REST API（127.0.0.1:8470）。单用户，只能经 SSH 端口转发访问 |
+| `srdq web` | srdq-ctl | 看板和 REST API（0.0.0.0:8470）。单用户，无登录，可直接用 ECS IP 访问 |
 | `srdq executor --side huawei` | srdq-hw | 只持有华为 SR 的只读凭证，执行只读查询，上传计数、汇总和样本指纹 |
 | `srdq executor --side aliyun` | srdq-al | 同上，负责阿里云 |
 
@@ -117,11 +117,7 @@ uv run python scripts/demo.py     # 本地演示，数据目录默认 /tmp/srdq-
 
 4. **访问看板**
 
-   ```bash
-   ssh -J <user>@<jump-host> -L 8470:127.0.0.1:8470 <user>@<ecs>
-   ```
-
-   然后在本机浏览器打开 http://127.0.0.1:8470。服务部署后已经处于允许运行状态。
+   在浏览器打开 `http://<ECS IP>:8470/`（安全组需放通 8470 端口）。服务部署后已经处于允许运行状态。
 
 ### 离线升级和回滚
 

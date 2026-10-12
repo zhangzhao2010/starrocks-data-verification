@@ -1,5 +1,5 @@
 [Unit]
-Description=srdq web dashboard and REST API (127.0.0.1:8470, reach it through an SSH tunnel)
+Description=srdq web dashboard and REST API (0.0.0.0:8470)
 Requires=srdq-pg.service
 After=network-online.target srdq-pg.service srdq-controller.service
 Wants=srdq-controller.service
@@ -21,8 +21,6 @@ ProtectHome=yes
 ReadWritePaths=/var/lib/srdq/reports
 InaccessiblePaths=-/etc/srdq/secrets/huawei.json -/etc/srdq/secrets/aliyun.json
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-IPAddressDeny=any
-IPAddressAllow=localhost
 
 [Install]
 WantedBy=multi-user.target

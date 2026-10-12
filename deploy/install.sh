@@ -28,6 +28,5 @@ systemctl is-active --quiet srdq-controller.service srdq-web.service srdq-execut
 cat <<EOF
 srdq $BUNDLE_VERSION installed with the packaged production configuration; all services are running.
 Configuration: $CONFIG_FILE
-Dashboard tunnel:
-  ssh -J <user>@<jump-host> -L 8470:127.0.0.1:8470 <user>@<ecs>
+Dashboard: http://<ecs-ip>:8470/
 EOF

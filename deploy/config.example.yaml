@@ -11,12 +11,12 @@ deployment:
 
 execution_window:               # 本地时区；可以跨午夜
   timezone: Asia/Shanghai
-  open_at: "00:00"
+  open_at: "20:00"
   drain_at: "07:30"             # 之后不再派新工作，已开始的观察可以收尾
   close_at: "08:00"             # 到点取消并确认终止
 
 execution:
-  concurrency_per_cluster: 2    # 每个集群的初始并发，负载保护只会往下调
+  concurrency_per_cluster: 40   # 每个集群的并发上限，负载保护可临时下调
   query_timeout_seconds: 300
   lease_seconds: 120
   heartbeat_seconds: 30
@@ -39,7 +39,7 @@ credentials:
   controller_pg: {file: /etc/srdq/secrets/pg.json, os_user: srdq-ctl, mode: "0600"}
 
 web:
-  bind_address: 127.0.0.1       # 只能是本机地址；经 SSH 端口转发访问：ssh -L 8470:127.0.0.1:8470 ecs
+  bind_address: 0.0.0.0         # 监听所有地址，浏览器直接访问 http://<ECS IP>:8470/
   port: 8470
 
 controller:
@@ -50,3 +50,4 @@ controller:
 executor:
   controller_url: http://127.0.0.1:8471
   data_dir: /var/lib/srdq/executor
+  poll_seconds: 0.2            # 执行器领取工作的轮询间隔（秒）

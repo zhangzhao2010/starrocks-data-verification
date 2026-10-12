@@ -1,9 +1,8 @@
-"""Web / API process (doc 03 §2.1, §16): loopback only, single user, no login; Origin/Host checks; strict CSP."""
+"""Web / API process (doc 03 §2.1, §16): single user, no login, no access restrictions; strict CSP."""
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -17,8 +16,6 @@ from . import api, ui
 log = logging.getLogger("srdq.web")
 
 HERE = Path(__file__).parent
-LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
-SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; "
        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 SECURITY_HEADERS = {
@@ -30,23 +27,6 @@ SECURITY_HEADERS = {
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cross-Origin-Resource-Policy": "same-origin",
 }
-
-
-def host_name(host: str) -> str:
-    host = host.strip().lower()
-    if host.startswith("["):
-        return host[1:host.find("]")] if "]" in host else ""
-    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-
-
-def origin_ok(origin: str, host: str) -> bool:
-    """Same-origin only: the Origin's host:port must be the request Host (browsers behind an SSH tunnel included)."""
-    try:
-        u = urlsplit(origin)
-    except ValueError:
-        return False
-    return u.scheme in ("http", "https") and u.netloc.lower() == host.strip().lower() \
-        and host_name(u.netloc) in LOOPBACK_NAMES
 
 
 def _wants_html(request: Request) -> bool:
@@ -62,19 +42,10 @@ def _error_response(request: Request, status: int, body: dict) -> HTMLResponse |
 def create_web_app(ctx: Ctx) -> FastAPI:
     app = FastAPI(title="srdq", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.ctx = ctx
-    check_origin = bool(ctx.cfg["web"]["origin_check"])
 
     @app.middleware("http")
-    async def guard(request: Request, call_next):
-        host = request.headers.get("host", "")
-        if host_name(host) not in LOOPBACK_NAMES:
-            resp = JSONResponse({"code": "HOST_REJECTED", "message": "only loopback Host headers are served"},
-                                status_code=403)
-        elif check_origin and request.method not in SAFE_METHODS and not _same_origin(request, host):
-            resp = JSONResponse({"code": "ORIGIN_REJECTED", "message": "cross-origin write rejected"},
-                                status_code=403)
-        else:
-            resp = await call_next(request)
+    async def security_headers(request: Request, call_next):
+        resp = await call_next(request)
         for k, v in SECURITY_HEADERS.items():
             resp.headers.setdefault(k, v)
         return resp
@@ -103,16 +74,3 @@ def create_web_app(ctx: Ctx) -> FastAPI:
     app.include_router(api.router)
     app.include_router(ui.router)
     return app
-
-
-def _same_origin(request: Request, host: str) -> bool:
-    if request.headers.get("sec-fetch-site") == "cross-site":
-        return False
-    origin = request.headers.get("origin")
-    if origin is not None:
-        return origin_ok(origin, host)
-    ref = request.headers.get("referer")
-    if ref is not None:
-        u = urlsplit(ref)
-        return origin_ok(f"{u.scheme}://{u.netloc}", host)
-    return True  # non-browser client on the same host (curl, CLI); browsers always send Origin on POST

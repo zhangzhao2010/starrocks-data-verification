@@ -37,7 +37,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "execution_window": {
         "timezone": "Asia/Shanghai",
-        "open_at": "00:00",
+        "open_at": "20:00",
         "drain_at": "07:30",
         "close_at": "08:00",
         "on_close": "CANCEL_AND_CONFIRM",
@@ -117,7 +117,7 @@ DEFAULTS: dict[str, Any] = {
         "regenerate_mode": "NEW_RUN",
     },
     "execution": {
-        "concurrency_per_cluster": 2,
+        "concurrency_per_cluster": 40,
         "lease_seconds": 120,
         "heartbeat_seconds": 30,
         "query_timeout_seconds": 300,
@@ -195,11 +195,10 @@ DEFAULTS: dict[str, Any] = {
         "cancel_on_end": False,
     },
     "web": {
-        "bind_address": "127.0.0.1",
+        "bind_address": "0.0.0.0",
         "port": 8470,
-        "authorization": "NONE_LOCAL_ONLY",
+        "authorization": "NONE",
         "worker_auth": "SIDE_BOUND_TOKEN",
-        "origin_check": True,
         "max_page_size": 200,
         "operation_preview_required": True,
         "default_masked_values": True,
@@ -213,7 +212,7 @@ DEFAULTS: dict[str, Any] = {
     "executor": {
         "controller_url": "http://127.0.0.1:8471",
         "data_dir": "/var/lib/srdq/executor",
-        "poll_seconds": 5,
+        "poll_seconds": 0.2,
     },
 }
 
@@ -272,7 +271,7 @@ _FIXED = {
     ("difference", "trend_basis"): ["OBSERVED_EQUAL", "OBSERVED_DIFFERENT"],
     ("error_classification", "storage_suspect_auto_pause"): False,
     ("report", "trigger"): "AFTER_WINDOW_CLOSED",
-    ("web", "authorization"): "NONE_LOCAL_ONLY",
+    ("web", "authorization"): "NONE",
     ("web", "worker_auth"): "SIDE_BOUND_TOKEN",
 }
 
@@ -387,11 +386,9 @@ def validate(cfg: dict) -> None:
         raise ConfigError("notification.channels: only DASHBOARD and DAILY_REPORT are allowed (no outbound messages)")
     if not set(cfg["report"]["formats"]) <= {"MARKDOWN", "CSV_UTF8_BOM"}:
         raise ConfigError("report.formats: only MARKDOWN and CSV_UTF8_BOM")
-    for bind in (cfg["web"]["bind_address"], cfg["controller"]["worker_api_bind"]):
-        if bind not in ("127.0.0.1", "::1", "localhost") and cfg["deployment"]["mode"] == "CENTRAL":
-            raise ConfigError("web/controller must listen on loopback only in CENTRAL mode")
-    if cfg["web"]["bind_address"] not in ("127.0.0.1", "::1", "localhost"):
-        raise ConfigError("web.bind_address must be a loopback address")
+    if cfg["controller"]["worker_api_bind"] not in ("127.0.0.1", "::1", "localhost") \
+            and cfg["deployment"]["mode"] == "CENTRAL":
+        raise ConfigError("controller.worker_api_bind must be a loopback address in CENTRAL mode")
     if not set(cfg["transfer"]["globally_approved_classes"]) <= {"SUMMARY_ONLY", "AGGREGATES_APPROVED",
                                                                "SAMPLE_VALUES_APPROVED"}:
         raise ConfigError("transfer.globally_approved_classes cannot include DETAIL_APPROVED")

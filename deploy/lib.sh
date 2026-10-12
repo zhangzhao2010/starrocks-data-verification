@@ -146,7 +146,6 @@ install_deploy_files() {
   local source relative
   install -d -o root -g root -m 0755 "$SRDQ_ROOT/deploy"
   install -o root -g root -m 0755 "$BUNDLE_ROOT/deploy/bin/srdq-pg-backup" "$SRDQ_ROOT/bin/srdq-pg-backup"
-  install -o root -g root -m 0755 "$BUNDLE_ROOT/deploy/bin/srdq-web-proxy" "$SRDQ_ROOT/bin/srdq-web-proxy"
   install -o root -g root -m 0755 "$BUNDLE_ROOT/deploy/lib.sh" "$BUNDLE_ROOT/deploy/install.sh" \
     "$BUNDLE_ROOT/deploy/upgrade.sh" "$BUNDLE_ROOT/deploy/rollback.sh" "$SRDQ_ROOT/deploy/"
   while IFS= read -r -d '' source; do
