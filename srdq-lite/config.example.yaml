@@ -1,0 +1,25 @@
+source:
+  host: source-fe.example.com
+  port: 9030
+  user: readonly_user
+  password_env: SR_SOURCE_PASSWORD
+  ssl: false
+
+target:
+  host: target-fe.example.com
+  port: 9030
+  user: readonly_user
+  password_env: SR_TARGET_PASSWORD
+  ssl: false
+
+run:
+  concurrency: 4
+  connect_timeout_s: 10
+  query_timeout_s: 600
+  retries: 2
+  max_partitions_per_sql: 100
+  max_rows_per_sql: 2000000000
+  max_diffs_per_rule: 10000
+
+session:
+  time_zone: Asia/Shanghai
