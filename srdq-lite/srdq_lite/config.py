@@ -13,7 +13,6 @@ import yaml
 
 RULE_NAMES = ("ROW_COUNT", "METRIC", "SAMPLE")
 METRIC_FUNCS = ("SUM", "MIN", "MAX", "COUNT", "COUNT_NULL", "COUNT_DISTINCT")
-SAMPLE_MOD = 1_000_000
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
 
@@ -43,6 +42,7 @@ class RunSettings:
     retries: int = 2
     max_partitions_per_sql: int = 100
     max_rows_per_sql: int = 2_000_000_000
+    sample_partitions_per_sql: int = 10
     max_diffs_per_rule: int = 10_000
 
 
@@ -244,7 +244,7 @@ def _metric_config(cfg: dict, where: str) -> dict:
 
 
 def _sample_config(cfg: dict, where: str) -> dict:
-    _no_unknown(cfg, {"key", "columns", "exclude_columns", "ratio", "buckets", "filter"}, where)
+    _no_unknown(cfg, {"key", "columns", "exclude_columns", "ratio", "max_rows", "filter"}, where)
     key = cfg.get("key")
     if key is not None:
         key = [key] if isinstance(key, str) else _str_list(key, f"{where}.key")
@@ -256,14 +256,10 @@ def _sample_config(cfg: dict, where: str) -> dict:
     ratio = cfg.get("ratio", 0.001)
     if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) or not 0 < ratio <= 1:
         raise ConfigError(f"{where}: ratio must be in (0, 1]")
-    if round(ratio * SAMPLE_MOD) < 1:
-        raise ConfigError(f"{where}: ratio must be >= {1 / SAMPLE_MOD}")
-    buckets = _pos_int(cfg.get("buckets", 256), f"{where}.buckets")
-    if buckets > 65536:
-        raise ConfigError(f"{where}: buckets must be <= 65536")
     return {"key": key, "columns": columns, "exclude_columns": _str_list(cfg.get("exclude_columns") or [],
                                                                           f"{where}.exclude_columns"),
-            "ratio": float(ratio), "buckets": buckets, "filter": _filter(cfg.get("filter"), where)}
+            "ratio": float(ratio), "max_rows": _pos_int(cfg.get("max_rows", 10_000), f"{where}.max_rows"),
+            "filter": _filter(cfg.get("filter"), where)}
 
 
 def _filter(raw: Any, where: str) -> dict | None:

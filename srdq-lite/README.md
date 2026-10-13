@@ -54,7 +54,8 @@ export SR_TARGET_PASSWORD='...'
 - `connect_timeout_s`、`query_timeout_s`：连接及查询超时。
 - `retries`：可重试错误的重试次数。
 - `max_partitions_per_sql`：一条 UNION ALL SQL 最多合并的分区数。
-- `max_rows_per_sql`：单任务允许写入结果文件的最大行数。
+- `max_rows_per_sql`：一条 UNION ALL SQL 合并分区的元数据行数上限。
+- `sample_partitions_per_sql`：SAMPLE 抽样/回查 SQL 最多合并的分区数，默认 10。
 - `max_diffs_per_rule`：每张表每条规则最多写出的差异数。
 
 `session` 中的键值会作为 StarRocks session variable 设置。
@@ -81,10 +82,16 @@ export SR_TARGET_PASSWORD='...'
 
 ### SAMPLE
 
-仅适用于 PRIMARY KEY / UNIQUE KEY 表。按主键稳定采样，先比较 bucket 摘要，只对不一致 bucket 流式下钻，最终输出具体主键和差异列。
+仅适用于 PRIMARY KEY / UNIQUE KEY 表。逐分区执行，只读 source 的少量行，再按主键回查 target：
 
-- `ratio`：采样比例，范围 `(0, 1]`；`1` 表示全量行。
-- `buckets`：摘要桶数，默认 256。
+1. 统计 source 每个分区行数（与同过滤条件的 ROW_COUNT 共用同一次查询）。
+2. 每个分区抽 `min(max_rows, max(1, 行数 × ratio))` 行：`SELECT ... FROM t PARTITION(p) LIMIT n`，每条 SQL 用 UNION ALL 合并 `sample_partitions_per_sql` 个分区。
+3. 用抽到的主键值到 target 对应分区查询（每个 Key 列一个 `IN` 列表，可走前缀索引），逐行比较各列。
+
+`LIMIT` 没有 `ORDER BY`，取到的是各 tablet 最先读到的行，不是随机样本，重复运行通常抽到相同的行。抽样只检查 source 中的行是否在 target 存在且一致；target 多出的行由 ROW_COUNT 发现。
+
+- `ratio`：每分区抽样比例，范围 `(0, 1]`，默认 `0.001`。
+- `max_rows`：每分区最多抽样行数，默认 10000。
 - `key`：可选，必须与表 Key 一致；省略时自动使用表 Key。
 - `columns`：`"*"` 或列名数组。
 - `exclude_columns`：从采样列中排除。
@@ -126,8 +133,9 @@ python -m srdq_lite report -o runs/test
 
 - `run.json`、`01_connectivity.json`：运行参数及连接检查。
 - `02_metadata.jsonl`：表、列、Key 和分区检查。
-- `03_tasks.jsonl`、`06_drill_tasks.jsonl`：主任务和 SAMPLE 下钻 SQL。
-- `04_results.jsonl`、`07_drill_results.jsonl`：两侧任务执行状态。
+- `03_tasks.jsonl`、`04_results.jsonl`：主任务 SQL（ROW_COUNT、METRIC、SAMPLE 行数统计）及执行状态。
+- `06_sample_pick_tasks.jsonl`、`07_sample_pick_results.jsonl`：SAMPLE 在 source 的抽样 SQL 及执行状态。
+- `08_sample_lookup_tasks.jsonl`、`09_sample_lookup_results.jsonl`：SAMPLE 在 target 的主键回查 SQL 及执行状态。
 - `results/*.jsonl.gz`：流式查询结果。
 - `05_compare.jsonl`：分区/规则级比较结果。
 - `table_summary.jsonl`、`table_summary.csv`：每张表汇总。

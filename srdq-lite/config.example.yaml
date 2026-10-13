@@ -19,6 +19,7 @@ run:
   retries: 2
   max_partitions_per_sql: 100
   max_rows_per_sql: 2000000000
+  sample_partitions_per_sql: 10
   max_diffs_per_rule: 10000
 
 session:

@@ -6,7 +6,7 @@ import re
 import time
 from typing import Any
 
-from .config import SAMPLE_MOD, Cluster, Rule, RunSettings, TableSpec
+from .config import Cluster, Rule, RunSettings, TableSpec
 from .sr import Connection, SRError
 
 _RANGE_KEYS_RE = re.compile(r"keys:\s*\[(.*?)\];")
@@ -298,5 +298,5 @@ def _resolve_sample(rule: Rule, src: dict, col, issues: list) -> dict:
             if c["cat"] == "unsupported":
                 raise RuleProblem("BLOCKED", f"sample column {name} has an incomparable type")
             columns.append(c)
-    return {"keys": keys, "columns": columns, "ratio": cfg["ratio"],
-            "threshold": int(round(cfg["ratio"] * SAMPLE_MOD)), "buckets": cfg["buckets"], "filter": cfg["filter"]}
+    return {"keys": keys, "columns": columns, "ratio": cfg["ratio"], "max_rows": cfg["max_rows"],
+            "filter": cfg["filter"]}

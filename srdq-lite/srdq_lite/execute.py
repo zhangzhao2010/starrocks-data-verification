@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import RunSettings
-from .plan import SIDES
+from .plan import SIDES, task_sides
 from .sr import ConnPool, SRError
 from .store import JsonlAppender, dumps, read_jsonl
 
@@ -53,15 +53,17 @@ def run_tasks(tasks: list[dict], *, phase: str, results_path: Path, results_dir:
     results_dir.mkdir(parents=True, exist_ok=True)
     done = latest_records(results_path)
     pending: list[tuple[dict, str]] = []
+    total_sides = 0
     for t in tasks:
-        for side in SIDES:
+        for side in task_sides(t):
+            total_sides += 1
             rec = done.get((t["task_id"], side))
             if rec and rec["status"] == "OK" and (results_dir.parent / rec["file"]).exists():
                 continue
             if rec and rec["status"] == "FAILED" and not retry_failed:
                 continue
             pending.append((t, side))
-    skipped = len(tasks) * 2 - len(pending)
+    skipped = total_sides - len(pending)
     log.info("[%s] %d tasks, %d side-runs pending, %d already recorded", phase, len(tasks), len(pending), skipped)
     if not pending:
         return
@@ -91,7 +93,7 @@ def run_tasks(tasks: list[dict], *, phase: str, results_path: Path, results_dir:
                     for row in gen:
                         rows += 1
                         if task.get("max_rows") and rows > task["max_rows"]:
-                            raise _Abort(f"result exceeds {task['max_rows']} rows (max_groups per partition)")
+                            raise _Abort(f"result exceeds {task['max_rows']} rows ({task.get('max_rows_note')})")
                         f.write(dumps([canon(v) for v in row]))
                         f.write("\n")
                 os.replace(tmp, final)

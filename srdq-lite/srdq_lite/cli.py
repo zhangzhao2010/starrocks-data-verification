@@ -13,8 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import __version__
-from .compare import Results, build_outputs, derive_drills
-from .config import Config, ConfigError, TableSpec, canonical_hash, load_config, load_tables
+from .compare import Results, build_outputs, derive_lookups, derive_picks
+from .config import Config, ConfigError, RunSettings, TableSpec, canonical_hash, load_config, load_tables
 from .execute import run_tasks
 from .meta import build_entry, check_connectivity, fetch_table_meta
 from .plan import plan_main
@@ -24,7 +24,8 @@ from .store import JsonlAppender, RunLock, read_json, read_jsonl, write_json, wr
 log = logging.getLogger("srdq_lite")
 
 GENERATED = ["01_connectivity.json", "02_metadata.jsonl", "03_tasks.jsonl", "04_results.jsonl",
-             "05_compare.jsonl", "06_drill_tasks.jsonl", "07_drill_results.jsonl", "results", "summary.json",
+             "05_compare.jsonl", "06_sample_pick_tasks.jsonl", "07_sample_pick_results.jsonl",
+             "08_sample_lookup_tasks.jsonl", "09_sample_lookup_results.jsonl", "results", "summary.json",
              "table_summary.jsonl", "table_summary.csv", "diffs.jsonl", "diffs.csv", "failed_tasks.jsonl",
              "run.json"]
 
@@ -134,10 +135,19 @@ def cmd_run(args, out: Path) -> int:
             return 0
         run_tasks(tasks, phase="main", results_path=out / "04_results.jsonl", results_dir=out / "results",
                   pools=pools, run=cfg.run, retry_failed=args.retry_failed)
-        drills = derive_drills(entries, tasks, Results(out, out / "04_results.jsonl"))
-        write_jsonl(out / "06_drill_tasks.jsonl", drills)
-        run_tasks(drills, phase="drill", results_path=out / "07_drill_results.jsonl", results_dir=out / "results",
-                  pools=pools, run=cfg.run, retry_failed=args.retry_failed)
+        max_parts = cfg.run.sample_partitions_per_sql
+        picks = derive_picks(entries, tasks, Results(out, out / "04_results.jsonl"), max_parts)
+        write_jsonl(out / "06_sample_pick_tasks.jsonl", picks)
+        if picks:
+            log.info("[sample] %d pick tasks; see 06_sample_pick_tasks.jsonl", len(picks))
+        run_tasks(picks, phase="pick", results_path=out / "07_sample_pick_results.jsonl",
+                  results_dir=out / "results", pools=pools, run=cfg.run, retry_failed=args.retry_failed)
+        lookups = derive_lookups(entries, picks, Results(out, out / "07_sample_pick_results.jsonl"), max_parts)
+        write_jsonl(out / "08_sample_lookup_tasks.jsonl", lookups)
+        if lookups:
+            log.info("[sample] %d lookup tasks; see 08_sample_lookup_tasks.jsonl", len(lookups))
+        run_tasks(lookups, phase="lookup", results_path=out / "09_sample_lookup_results.jsonl",
+                  results_dir=out / "results", pools=pools, run=cfg.run, retry_failed=args.retry_failed)
     finally:
         for p in pools.values():
             p.close_all()
@@ -191,12 +201,17 @@ def cmd_report(out: Path) -> int:
 def _report(out: Path, meta: dict, entries: list[dict], tasks: list[dict], conn_info: list[dict],
             started: float) -> int:
     main_res = Results(out, out / "04_results.jsonl")
-    drills = derive_drills(entries, tasks, main_res)
-    drill_res = Results(out, out / "07_drill_results.jsonl")
-    stats = build_outputs(out, meta["run_id"], entries, tasks, drills, main_res, drill_res,
-                          meta["settings"]["run"]["max_diffs_per_rule"])
+    settings = meta["settings"]["run"]
+    max_parts = settings.get("sample_partitions_per_sql", RunSettings.sample_partitions_per_sql)
+    picks = derive_picks(entries, tasks, main_res, max_parts)
+    pick_res = Results(out, out / "07_sample_pick_results.jsonl")
+    lookups = derive_lookups(entries, picks, pick_res, max_parts)
+    lookup_res = Results(out, out / "09_sample_lookup_results.jsonl")
+    stats = build_outputs(out, meta["run_id"], entries, tasks, picks, lookups, main_res, pick_res, lookup_res,
+                          settings["max_diffs_per_rule"])
     task_states = {name: Counter(res.state(t)[0] for t in ts)
-                   for name, ts, res in (("main", tasks, main_res), ("drill", drills, drill_res))}
+                   for name, ts, res in (("main", tasks, main_res), ("pick", picks, pick_res),
+                                         ("lookup", lookups, lookup_res))}
     tables = stats["tables"]
     code = 2 if tables.get("ERROR") or stats["failed_tasks"] else 1 if tables.get("DIFF") or tables.get("BLOCKED") else 0
     sides = {c["side"]: c for c in conn_info}

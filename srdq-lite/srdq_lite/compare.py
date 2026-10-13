@@ -1,4 +1,4 @@
-"""Compare both sides' results, derive SAMPLE drill-down tasks, and write the report files."""
+"""Compare both sides' results, derive SAMPLE pick/lookup tasks, and write the report files."""
 from __future__ import annotations
 
 import csv
@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .execute import latest_records
-from .plan import SIDES, plan_drill
+from .plan import SIDES, plan_lookups, plan_picks, task_sides
 from .store import dumps, iter_gz_rows, write_csv, write_jsonl
 
 STATUS_PRIORITY = ("DIFF", "ERROR", "BLOCKED", "PASS", "SKIPPED")
@@ -123,13 +123,18 @@ class Results:
         self.out_dir = out_dir
         self.recs = latest_records(records_path)
 
+    def side_ok(self, task: dict, side: str) -> bool:
+        r = self.recs.get((task["task_id"], side))
+        return bool(r and r["status"] == "OK" and (self.out_dir / r["file"]).exists())
+
     def state(self, task: dict | None) -> tuple[str, str | None]:
         if task is None:
             return "PENDING", "not planned"
-        recs = [self.recs.get((task["task_id"], s)) for s in SIDES]
-        if all(r and r["status"] == "OK" and (self.out_dir / r["file"]).exists() for r in recs):
+        sides = task_sides(task)
+        if all(self.side_ok(task, s) for s in sides):
             return "OK", None
-        errors = [f"{s}: {r['error']}" for s, r in zip(SIDES, recs) if r and r["status"] == "FAILED"]
+        recs = {s: self.recs.get((task["task_id"], s)) for s in sides}
+        errors = [f"{s}: {r['error']}" for s, r in recs.items() if r and r["status"] == "FAILED"]
         if errors:
             return "FAILED", "; ".join(errors)
         return "PENDING", "not executed yet"
@@ -138,11 +143,12 @@ class Results:
         return iter_gz_rows(self.out_dir / self.recs[(task["task_id"], side)]["file"])
 
     def elapsed(self, task: dict) -> float:
-        return max((r["elapsed_s"] for s in SIDES if (r := self.recs.get((task["task_id"], s)))), default=0.0)
+        return max((r["elapsed_s"] for s in task_sides(task) if (r := self.recs.get((task["task_id"], s)))),
+                   default=0.0)
 
     def failures(self, task: dict) -> list[dict]:
         out = []
-        for s in SIDES:
+        for s in task_sides(task):
             r = self.recs.get((task["task_id"], s))
             if r is None or r["status"] != "OK":
                 out.append({"side": s, "status": r["status"] if r else "PENDING",
@@ -150,32 +156,51 @@ class Results:
         return out
 
 
-def sample_buckets(results: Results, task: dict) -> tuple[dict[int, list[int]], dict[int, set[int]]]:
-    """Per partition index: sampled rows [src, tgt], and the set of buckets whose (count, fingerprint) differ."""
-    sides = [{(int(r[0]), int(r[1])): (int(r[2]), str(r[3])) for r in results.rows(task, s)} for s in SIDES]
-    counts: dict[int, list[int]] = defaultdict(lambda: [0, 0])
-    mismatched: dict[int, set[int]] = defaultdict(set)
-    for idx, side in enumerate(sides):
-        for (p, _), (cnt, _) in side.items():
-            counts[p][idx] += cnt
-    for k in set(sides[0]) | set(sides[1]):
-        if sides[0].get(k) != sides[1].get(k):
-            mismatched[k[0]].add(k[1])
-    return dict(counts), dict(mismatched)
+def _rule_of(entry: dict, task: dict) -> dict:
+    return next(r for r in entry["rules"] if r["key"] == task["rule_key"])
 
 
-def derive_drills(entries: list[dict], main_tasks: list[dict], results: Results) -> list[dict]:
+def count_task(task: dict, main_by_id: dict[str, dict]) -> dict:
+    return main_by_id[task["count_from"]] if task.get("count_from") else task
+
+
+def derive_picks(entries: list[dict], main_tasks: list[dict], results: Results, max_parts: int) -> list[dict]:
     by_table = {e["table_id"]: e for e in entries}
-    drills = []
+    by_id = {t["task_id"]: t for t in main_tasks}
+    picks = []
     for t in main_tasks:
-        if t["rule"] != "SAMPLE" or results.state(t)[0] != "OK":
+        if t["rule"] != "SAMPLE":
             continue
-        _, mism = sample_buckets(results, t)
-        if mism:
-            entry = by_table[t["table_id"]]
-            rule = next(r for r in entry["rules"] if r["key"] == t["rule_key"])
-            drills.append(plan_drill(entry, rule, t, mism))
-    return drills
+        ct = count_task(t, by_id)
+        if not results.side_ok(ct, "source"):
+            continue
+        counts = {int(r[0]): int(r[1]) for r in results.rows(ct, "source")}
+        entry = by_table[t["table_id"]]
+        picks.extend(plan_picks(entry, _rule_of(entry, t), t, counts, max_parts))
+    return picks
+
+
+def derive_lookups(entries: list[dict], picks: list[dict], results: Results, max_parts: int) -> list[dict]:
+    by_table = {e["table_id"]: e for e in entries}
+    lookups = []
+    for pick in picks:
+        if results.side_ok(pick, "source"):
+            entry = by_table[pick["table_id"]]
+            lookups.extend(plan_lookups(entry, _rule_of(entry, pick), pick, results.rows(pick, "source"), max_parts))
+    return lookups
+
+
+class SampleContext:
+    def __init__(self, main_tasks: list[dict], picks: list[dict], lookups: list[dict], main_res: Results,
+                 pick_res: Results, lookup_res: Results):
+        self.main_by_id = {t["task_id"]: t for t in main_tasks}
+        self.picks: dict[str, list[dict]] = defaultdict(list)
+        self.lookups: dict[str, list[dict]] = defaultdict(list)
+        for t in picks:
+            self.picks[t["parent_task_id"]].append(t)
+        for t in lookups:
+            self.lookups[t["parent_task_id"]].append(t)
+        self.main_res, self.pick_res, self.lookup_res = main_res, pick_res, lookup_res
 
 
 # ---------------------------------------------------------------- output sink
@@ -296,38 +321,39 @@ def _compare_metric(sink: Sink, entry: dict, rule: dict, task: dict, res: Result
         st["statuses"].append(status)
 
 
-def _compare_sample(sink: Sink, entry: dict, rule: dict, task: dict, res: Results, drill: dict | None,
-                    drill_res: Results, st: dict) -> None:
-    counts, mism = sample_buckets(res, task)
-    diff_keys: dict[int, int] = defaultdict(int)
-    drill_error = None
-    if mism:
-        state, err = drill_res.state(drill)
+def _compare_sample(sink: Sink, entry: dict, rule: dict, task: dict, ctx: SampleContext, st: dict,
+                    failed: list[dict]) -> float:
+    ct = count_task(task, ctx.main_by_id)
+    if ct is not task and not ctx.main_res.side_ok(ct, "source"):
+        _error_parts(sink, entry, rule, task, task["parts"],
+                     f"source row count task {ct['task_id']} not available", st)
+        return 0.0
+    elapsed = 0.0
+    covered: set[str] = set()
+    for pick in ctx.picks.get(task["task_id"], []):
+        elapsed += _compare_pick(sink, entry, rule, pick, ctx, st, failed)
+        covered.update(p["key"] for p in pick["parts"])
+    for part in task["parts"]:
+        if part["key"] not in covered:
+            sink.compare_row(entry, rule, part["key"], "PASS", 0, 0, note="empty partition", task_id=task["task_id"])
+            st["statuses"].append("PASS")
+    return elapsed
+
+
+def _compare_pick(sink: Sink, entry: dict, rule: dict, pick: dict, ctx: SampleContext, st: dict,
+                  failed: list[dict]) -> float:
+    lookups = ctx.lookups.get(pick["task_id"], [])
+    elapsed = ctx.pick_res.elapsed(pick) + sum(ctx.lookup_res.elapsed(t) for t in lookups)
+    errors = []
+    for t, res in [(pick, ctx.pick_res)] + [(t, ctx.lookup_res) for t in lookups]:
+        state, err = res.state(t)
         if state != "OK":
-            drill_error = f"drill-down {state.lower()}: {err}"
-        else:
-            try:
-                _sample_drill(sink, entry, rule, drill, drill_res, diff_keys)
-            except OrderError as e:
-                drill_error = str(e)
-    for i, part in enumerate(task["parts"]):
-        s, t = counts.get(i, (0, 0))
-        st["sample_rows"] += max(s, t)
-        if i in mism and drill_error:
-            sink.compare_row(entry, rule, part["key"], "ERROR", s, t, note=drill_error, task_id=task["task_id"])
-            st["statuses"].append("ERROR")
-            continue
-        d = diff_keys.get(part["key"], 0)
-        note = "bucket fingerprint differed but no row difference found" if i in mism and not d else None
-        status = "DIFF" if d else "PASS"
-        st["sample_diff_keys"] += d
-        sink.compare_row(entry, rule, part["key"], status, s, t, d, note=note, task_id=task["task_id"])
-        st["statuses"].append(status)
-    if drill_error:
-        st["notes"].append(f"rule {rule['key']}: {drill_error}")
+            failed.append(_failed(t, res, sink.run_id))
+            errors.append(f"{t['phase']} task {state.lower()}: {err}")
+    if errors:
+        _error_parts(sink, entry, rule, pick, pick["parts"], "; ".join(errors), st)
+        return elapsed
 
-
-def _sample_drill(sink: Sink, entry: dict, rule: dict, drill: dict, res: Results, diff_keys: dict) -> None:
     r = rule["resolved"]
     nk = len(r["keys"])
     knames = [k["src"] for k in r["keys"]]
@@ -336,38 +362,58 @@ def _sample_drill(sink: Sink, entry: dict, rule: dict, drill: dict, res: Results
     def keyfn(row: list) -> tuple:
         return int(row[0]), tuple(_null_first(v) for v in row[1:1 + nk])
 
-    def row_values(row: list) -> dict:
-        return {c["src"]: clip(row[1 + nk + j]) for j, c in enumerate(cols)}
+    def target_rows() -> Iterator[list]:
+        # Lookups return a superset of picked keys; clip each branch to its own key range so the
+        # concatenated stream stays ordered when one partition is split across several lookups.
+        for t in lookups:
+            ranges = {b["p"]: (keyfn([b["p"], *b["first"]]), keyfn([b["p"], *b["last"]])) for b in t["parts"]}
+            for row in ctx.lookup_res.rows(t, "target"):
+                rng = ranges.get(int(row[0]))
+                if rng and rng[0] <= keyfn(row) <= rng[1]:
+                    yield row
 
-    for key, a, b in merge(res.rows(drill, "source"), res.rows(drill, "target"), keyfn):
-        part_key = drill["parts"][key[0]]["key"]
-        any_row = (a or b)[0]
-        kv = any_row[1:1 + nk]
-        extra = {"key": kv[0] if nk == 1 else ", ".join(str(v) for v in kv)}
-        if nk > 1:
-            extra["key_columns"] = knames
-        args = (entry, rule["key"], rule["name"])
-        if len(a) > 1 or len(b) > 1:
-            sink.diff(*args, "SAMPLE_DUPLICATE_KEY", part_key, drill["task_id"], **extra,
-                      src=len(a), tgt=len(b))
-        elif not b:
-            sink.diff(*args, "SAMPLE_KEY_SOURCE_ONLY", part_key, drill["task_id"], **extra,
-                      values=row_values(a[0]))
-        elif not a:
-            sink.diff(*args, "SAMPLE_KEY_TARGET_ONLY", part_key, drill["task_id"], **extra,
-                      values=row_values(b[0]))
-        else:
-            ra, rb = a[0], b[0]
-            differs = False
-            for j, c in enumerate(cols):
-                va, vb = ra[1 + nk + j], rb[1 + nk + j]
-                if not values_equal(va, vb, c["cat"] in _NUMERIC_CATS):
-                    differs = True
-                    sink.diff(*args, "SAMPLE_COLUMN_DIFF", part_key, drill["task_id"], **extra,
-                              column=c["src"], src=va, tgt=vb)
-            if not differs:
+    per: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])  # picked keys, found keys, diff keys
+    try:
+        for key, a, b in merge(ctx.pick_res.rows(pick, "source"), target_rows(), keyfn):
+            if not a:
                 continue
-        diff_keys[part_key] += 1
+            cnt = per[key[0]]
+            part_key = pick["parts"][key[0]]["key"]
+            kv = a[0][1:1 + nk]
+            extra: dict[str, Any] = {"key": kv[0] if nk == 1 else ", ".join(str(v) for v in kv)}
+            if nk > 1:
+                extra["key_columns"] = knames
+            args = (entry, rule["key"], rule["name"])
+            cnt[0] += 1
+            cnt[1] += bool(b)
+            if len(a) > 1 or len(b) > 1:
+                sink.diff(*args, "SAMPLE_DUPLICATE_KEY", part_key, pick["task_id"], **extra, src=len(a), tgt=len(b))
+            elif not b:
+                sink.diff(*args, "SAMPLE_KEY_SOURCE_ONLY", part_key, pick["task_id"], **extra,
+                          values={c["src"]: clip(a[0][1 + nk + j]) for j, c in enumerate(cols)})
+            else:
+                differs = False
+                for j, c in enumerate(cols):
+                    va, vb = a[0][1 + nk + j], b[0][1 + nk + j]
+                    if not values_equal(va, vb, c["cat"] in _NUMERIC_CATS):
+                        differs = True
+                        sink.diff(*args, "SAMPLE_COLUMN_DIFF", part_key, pick["task_id"], **extra,
+                                  column=c["src"], src=va, tgt=vb)
+                if not differs:
+                    continue
+            cnt[2] += 1
+    except OrderError as e:
+        _error_parts(sink, entry, rule, pick, pick["parts"], str(e), st)
+        return elapsed
+    for i, part in enumerate(pick["parts"]):
+        s, t, d = per.get(i, (0, 0, 0))
+        status = "DIFF" if d else "PASS"
+        st["sample_rows"] += s
+        st["sample_diff_keys"] += d
+        sink.compare_row(entry, rule, part["key"], status, s, t, d, note=f"sampled {s} of {part['count']} rows",
+                         task_id=pick["task_id"])
+        st["statuses"].append(status)
+    return elapsed
 
 
 def _error_parts(sink: Sink, entry: dict, rule: dict, task: dict, parts: list[dict], error: str, st: dict) -> None:
@@ -383,8 +429,8 @@ def _new_stats() -> dict:
             "metric_groups": 0, "metric_diff_groups": 0, "sample_rows": 0, "sample_diff_keys": 0}
 
 
-def compare_table(sink: Sink, entry: dict, tasks: list[dict], drills: dict[str, dict], main_res: Results,
-                  drill_res: Results) -> tuple[dict, list[dict]]:
+def compare_table(sink: Sink, entry: dict, tasks: list[dict], ctx: SampleContext) -> tuple[dict, list[dict]]:
+    main_res = ctx.main_res
     by_type: dict[str, list[str]] = defaultdict(list)
     ran: set[str] = set()
     stats = {"ROW_COUNT": _new_stats(), "METRIC": _new_stats(), "SAMPLE": _new_stats()}
@@ -426,12 +472,7 @@ def compare_table(sink: Sink, entry: dict, tasks: list[dict], drills: dict[str, 
                 elif rule["name"] == "METRIC":
                     _compare_metric(sink, entry, rule, task, main_res, st)
                 else:
-                    drill = drills.get(task["task_id"])
-                    if drill is not None:
-                        elapsed += drill_res.elapsed(drill)
-                        if drill_res.state(drill)[0] != "OK":
-                            failed.append(_failed(drill, drill_res, sink.run_id))
-                    _compare_sample(sink, entry, rule, task, main_res, drill, drill_res, st)
+                    elapsed += _compare_sample(sink, entry, rule, task, ctx, st, failed)
             status = worst(st["statuses"][before:]) or "PASS"
         by_type[rule["name"]].append(status)
         rules_out.append({"key": rule["key"], "name": rule["name"], "status": status, "reason": rule.get("reason")})
@@ -479,17 +520,18 @@ def _failed(task: dict, res: Results, run_id: str) -> dict:
             "source_sql": task["source_sql"], "target_sql": task["target_sql"]}
 
 
-def build_outputs(out_dir: Path, run_id: str, entries: list[dict], main_tasks: list[dict], drill_tasks: list[dict],
-                  main_res: Results, drill_res: Results, max_diffs: int) -> dict:
+def build_outputs(out_dir: Path, run_id: str, entries: list[dict], main_tasks: list[dict], picks: list[dict],
+                  lookups: list[dict], main_res: Results, pick_res: Results, lookup_res: Results,
+                  max_diffs: int) -> dict:
     sink = Sink(out_dir, run_id, max_diffs)
     tasks_by_table: dict[str, list[dict]] = defaultdict(list)
     for t in main_tasks:
         tasks_by_table[t["table_id"]].append(t)
-    drills = {d["parent_task_id"]: d for d in drill_tasks}
+    ctx = SampleContext(main_tasks, picks, lookups, main_res, pick_res, lookup_res)
     rows, failed = [], []
     try:
         for entry in entries:
-            row, f = compare_table(sink, entry, tasks_by_table[entry["table_id"]], drills, main_res, drill_res)
+            row, f = compare_table(sink, entry, tasks_by_table[entry["table_id"]], ctx)
             rows.append(row)
             failed.extend(f)
     finally:
