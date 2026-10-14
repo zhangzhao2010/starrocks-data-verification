@@ -30,7 +30,7 @@ cp "$ROOT/README.md" "$ROOT/requirements.txt" "$ROOT/config.example.yaml" \
 mkdir -p "$STAGE/table_info/output"
 for CLUSTER in 数仓集群 监控集群 账单集群; do
   mkdir -p "$STAGE/table_info/output/$CLUSTER"
-  cp "$REPO/table_info/output/$CLUSTER/tables.jsonl" "$STAGE/table_info/output/$CLUSTER/tables.jsonl"
+  cp "$REPO/table_info/output/$CLUSTER/"tables*.jsonl "$STAGE/table_info/output/$CLUSTER/"
 done
 cp "$ROOT/offline/install.sh" "$ROOT/offline/run.sh" "$STAGE/"
 chmod 0755 "$STAGE/install.sh" "$STAGE/run.sh"

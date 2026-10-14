@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import csv
+import io
+import multiprocessing as mp
 import os
-from collections import Counter, defaultdict
+import signal
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from .execute import latest_records
 from .plan import SIDES, plan_lookups, plan_picks, task_sides
@@ -15,6 +19,8 @@ from .store import dumps, iter_gz_rows, write_csv, write_jsonl
 STATUS_PRIORITY = ("DIFF", "ERROR", "BLOCKED", "PASS", "SKIPPED")
 _NUMERIC_CATS = {"int", "decimal", "float", "bool"}
 MAX_VALUE_CHARS = 512
+LOOKUP_PICKS_PER_JOB = 16
+REPORT_FILES = ("05_compare.jsonl", "diffs.jsonl", "diffs.csv")
 
 DIFF_CSV_HEADER = ["run_id", "table_id", "rule_key", "rule", "diff_type", "partition", "key", "group", "metric",
                    "column", "src", "tgt", "delta", "task_id", "detail"]
@@ -29,6 +35,26 @@ TABLE_CSV_HEADER = ["run_id", "table_id", "source_table", "target_table", "statu
 def worst(statuses: Iterable[str]) -> str:
     s = set(statuses)
     return next((x for x in STATUS_PRIORITY if x in s), "")
+
+
+def _ignore_sigint() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def parallel_map(fn: Callable, jobs: Iterable[tuple]) -> Iterator[Any]:
+    """Run fn(*job) in worker processes, yielding results in job order with a bounded number in flight."""
+    workers = len(os.sched_getaffinity(0))
+    ex = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=_ignore_sigint)
+    pending: deque = deque()
+    try:
+        for job in jobs:
+            pending.append(ex.submit(fn, *job))
+            if len(pending) >= workers * 4:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
 
 
 # ---------------------------------------------------------------- value comparison
@@ -139,8 +165,19 @@ class Results:
             return "FAILED", "; ".join(errors)
         return "PENDING", "not executed yet"
 
+    def path(self, task: dict, side: str) -> Path:
+        return self.out_dir / self.recs[(task["task_id"], side)]["file"]
+
     def rows(self, task: dict, side: str) -> Iterator[list]:
-        return iter_gz_rows(self.out_dir / self.recs[(task["task_id"], side)]["file"])
+        return iter_gz_rows(self.path(task, side))
+
+    def subset(self, tasks: list[dict]) -> Results:
+        """Only the records of these tasks, small enough to ship to a worker process."""
+        r = Results.__new__(Results)
+        r.out_dir = self.out_dir
+        keys = ((t["task_id"], s) for t in tasks for s in SIDES)
+        r.recs = {k: self.recs[k] for k in keys if k in self.recs}
+        return r
 
     def elapsed(self, task: dict) -> float:
         return max((r["elapsed_s"] for s in task_sides(task) if (r := self.recs.get((task["task_id"], s)))),
@@ -180,14 +217,28 @@ def derive_picks(entries: list[dict], main_tasks: list[dict], results: Results, 
     return picks
 
 
+def _lookups_job(entry: dict, picks: list[dict], files: list[Path], max_parts: int) -> list[dict]:
+    out = []
+    for pick, f in zip(picks, files):
+        out.extend(plan_lookups(entry, _rule_of(entry, pick), pick, iter_gz_rows(f), max_parts))
+    return out
+
+
 def derive_lookups(entries: list[dict], picks: list[dict], results: Results, max_parts: int) -> list[dict]:
+    """Picks are independent, so their result files are scanned in parallel, a few picks of one table per job."""
     by_table = {e["table_id"]: e for e in entries}
-    lookups = []
-    for pick in picks:
-        if results.side_ok(pick, "source"):
-            entry = by_table[pick["table_id"]]
-            lookups.extend(plan_lookups(entry, _rule_of(entry, pick), pick, results.rows(pick, "source"), max_parts))
-    return lookups
+
+    def jobs() -> Iterator[tuple]:
+        chunk: list[dict] = []
+        for pick in (p for p in picks if results.side_ok(p, "source")):
+            if chunk and (pick["table_id"] != chunk[0]["table_id"] or len(chunk) >= LOOKUP_PICKS_PER_JOB):
+                yield by_table[chunk[0]["table_id"]], chunk, [results.path(p, "source") for p in chunk], max_parts
+                chunk = []
+            chunk.append(pick)
+        if chunk:
+            yield by_table[chunk[0]["table_id"]], chunk, [results.path(p, "source") for p in chunk], max_parts
+
+    return [t for part in parallel_map(_lookups_job, jobs()) for t in part]
 
 
 class SampleContext:
@@ -206,21 +257,23 @@ class SampleContext:
 # ---------------------------------------------------------------- output sink
 
 class Sink:
-    def __init__(self, out_dir: Path, run_id: str, max_diffs: int):
-        self.out_dir, self.run_id, self.max_diffs = out_dir, run_id, max_diffs
-        self._files = {name: open(out_dir / f"{name}.tmp", "w", encoding="utf-8", newline="")
-                       for name in ("05_compare.jsonl", "diffs.jsonl", "diffs.csv")}
-        self._files["diffs.csv"].write("\ufeff")
-        self._csv = csv.DictWriter(self._files["diffs.csv"], fieldnames=DIFF_CSV_HEADER)
-        self._csv.writeheader()
+    """Buffers one table's compare rows and diffs in memory; ReportWriter appends them in table order."""
+
+    def __init__(self, run_id: str, max_diffs: int):
+        self.run_id, self.max_diffs = run_id, max_diffs
+        self.bufs = {name: io.StringIO(newline="") for name in REPORT_FILES}
+        self._csv = csv.DictWriter(self.bufs["diffs.csv"], fieldnames=DIFF_CSV_HEADER)
         self.by_type: Counter = Counter()
         self.by_rule: Counter = Counter()
         self.written = 0
         self.truncated = 0
 
+    def texts(self) -> dict[str, str]:
+        return {name: b.getvalue() for name, b in self.bufs.items()}
+
     def compare_row(self, entry: dict, rule: dict, partition: str, status: str, src: Any, tgt: Any,
                     diffs: int = 0, note: str | None = None, task_id: str | None = None) -> None:
-        self._files["05_compare.jsonl"].write(dumps({
+        self.bufs["05_compare.jsonl"].write(dumps({
             "run_id": self.run_id, "table_id": entry["table_id"], "rule_key": rule["key"], "rule": rule["name"],
             "partition": partition, "status": status, "src": src, "tgt": tgt, "diffs": diffs, "note": note,
             "task_id": task_id}) + "\n")
@@ -237,12 +290,31 @@ class Sink:
                 fields[k] = clip(fields[k])
         rec = {"run_id": self.run_id, "table_id": entry["table_id"], "rule_key": rule_key, "rule": rule,
                "diff_type": diff_type, "partition": partition, **fields, "task_id": task_id}
-        self._files["diffs.jsonl"].write(dumps(rec) + "\n")
+        self.bufs["diffs.jsonl"].write(dumps(rec) + "\n")
         row = {k: rec.get(k) for k in DIFF_CSV_HEADER if k != "detail"}
         row["detail"] = {k: v for k, v in rec.items() if k not in DIFF_CSV_HEADER} or None
         self._csv.writerow({k: (dumps(v) if isinstance(v, (dict, list)) else "" if v is None else v)
                             for k, v in row.items()})
         self.written += 1
+
+
+class ReportWriter:
+    def __init__(self, out_dir: Path):
+        self.out_dir = out_dir
+        self._files = {name: open(out_dir / f"{name}.tmp", "w", encoding="utf-8", newline="")
+                       for name in REPORT_FILES}
+        self._files["diffs.csv"].write("\ufeff")
+        csv.DictWriter(self._files["diffs.csv"], fieldnames=DIFF_CSV_HEADER).writeheader()
+        self.by_type: Counter = Counter()
+        self.written = 0
+        self.truncated = 0
+
+    def add(self, texts: dict[str, str], by_type: Counter, written: int, truncated: int) -> None:
+        for name, text in texts.items():
+            self._files[name].write(text)
+        self.by_type.update(by_type)
+        self.written += written
+        self.truncated += truncated
 
     def close(self) -> None:
         for name, f in self._files.items():
@@ -520,25 +592,48 @@ def _failed(task: dict, res: Results, run_id: str) -> dict:
             "source_sql": task["source_sql"], "target_sql": task["target_sql"]}
 
 
+def _compare_table_job(entry: dict, tasks: list[dict], picks: list[dict], lookups: list[dict], main_res: Results,
+                       pick_res: Results, lookup_res: Results, run_id: str, max_diffs: int) -> tuple:
+    sink = Sink(run_id, max_diffs)
+    row, failed = compare_table(sink, entry, tasks, SampleContext(tasks, picks, lookups, main_res, pick_res,
+                                                                  lookup_res))
+    return row, failed, sink.texts(), sink.by_type, sink.written, sink.truncated
+
+
 def build_outputs(out_dir: Path, run_id: str, entries: list[dict], main_tasks: list[dict], picks: list[dict],
                   lookups: list[dict], main_res: Results, pick_res: Results, lookup_res: Results,
                   max_diffs: int) -> dict:
-    sink = Sink(out_dir, run_id, max_diffs)
+    """Tables are compared independently in worker processes; output keeps the serial table order."""
     tasks_by_table: dict[str, list[dict]] = defaultdict(list)
     for t in main_tasks:
         tasks_by_table[t["table_id"]].append(t)
-    ctx = SampleContext(main_tasks, picks, lookups, main_res, pick_res, lookup_res)
+    picks_by_parent: dict[str, list[dict]] = defaultdict(list)
+    for t in picks:
+        picks_by_parent[t["parent_task_id"]].append(t)
+    lookups_by_parent: dict[str, list[dict]] = defaultdict(list)
+    for t in lookups:
+        lookups_by_parent[t["parent_task_id"]].append(t)
+
+    def jobs() -> Iterator[tuple]:
+        for entry in entries:
+            tasks = tasks_by_table[entry["table_id"]]
+            tp = [p for t in tasks for p in picks_by_parent[t["task_id"]]]
+            tl = [x for p in tp for x in lookups_by_parent[p["task_id"]]]
+            yield (entry, tasks, tp, tl, main_res.subset(tasks), pick_res.subset(tp), lookup_res.subset(tl),
+                   run_id, max_diffs)
+
+    writer = ReportWriter(out_dir)
     rows, failed = [], []
     try:
-        for entry in entries:
-            row, f = compare_table(sink, entry, tasks_by_table[entry["table_id"]], ctx)
+        for row, f, texts, by_type, written, truncated in parallel_map(_compare_table_job, jobs()):
+            writer.add(texts, by_type, written, truncated)
             rows.append(row)
             failed.extend(f)
     finally:
-        sink.close()
+        writer.close()
     write_jsonl(out_dir / "table_summary.jsonl", rows)
     write_csv(out_dir / "table_summary.csv", TABLE_CSV_HEADER,
               [{**r, "meta_issues": "; ".join(r["meta_issues"])} for r in rows])
     write_jsonl(out_dir / "failed_tasks.jsonl", failed)
-    return {"tables": Counter(r["status"] for r in rows), "diffs_by_type": dict(sink.by_type),
-            "diffs_written": sink.written, "diffs_truncated": sink.truncated, "failed_tasks": len(failed)}
+    return {"tables": Counter(r["status"] for r in rows), "diffs_by_type": dict(writer.by_type),
+            "diffs_written": writer.written, "diffs_truncated": writer.truncated, "failed_tasks": len(failed)}

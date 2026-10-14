@@ -31,13 +31,23 @@ cd srdq-lite-offline-*-linux-x86_64
 
 目标服务器需要 Linux x86_64、glibc 2.17+ 和 Python 3.11 或 3.12；不需要外网、pip 或第三方 Python 包。可通过 `PYTHON_BIN=/path/to/python ./install.sh` 指定解释器。
 
-离线包内置三份生产表清单：
+离线包内置三个生产集群的表清单，每个集群目录下有全量清单和按层拆分的清单：
 
-- `table_info/output/数仓集群/tables.jsonl`
-- `table_info/output/监控集群/tables.jsonl`
-- `table_info/output/账单集群/tables.jsonl`
+- `table_info/output/<集群>/tables.jsonl`：该集群全部表。
+- `table_info/output/<集群>/tables_<层>.jsonl`：按 `assets.csv` 的 `layer` 拆分，层为 `ods`、`dwd`、`dws`、`ads`、`dim`、`other`（账单集群没有 `ads`、`other`）。
 
-清单对所有表逐分区执行 `ROW_COUNT`。只有 `core_table.csv` 中的核心表会执行金额字段 `SUM`、逐个状态字段 `GROUP BY + COUNT(*)` 和 `SAMPLE`；DUPLICATE KEY 核心表的 SAMPLE 会标记为 `SKIPPED`。
+集群目录为 `数仓集群`、`监控集群`、`账单集群`。所有表都会执行：
+
+- 逐分区 `ROW_COUNT`。
+- 有金额字段时，对金额字段做 `SUM`。
+- 每个状态字段做一次 `GROUP BY + COUNT(*)`。
+- PRIMARY KEY / UNIQUE KEY 表执行 `SAMPLE`；DUPLICATE / AGGREGATE 表不生成 SAMPLE。
+
+按层运行时，每层使用单独的输出目录，例如：
+
+```bash
+./run.sh run -c config.yaml -t table_info/output/数仓集群/tables_ods.jsonl -o runs/数仓-ods
+```
 
 ## 配置
 
@@ -50,7 +60,7 @@ export SR_TARGET_PASSWORD='...'
 
 `run` 参数：
 
-- `concurrency`：每侧并发查询数。
+- `concurrency`：每侧并发查询数。每条查询在独立子进程中执行，结果解析可用满多核；源端和目标端最多各启动 `concurrency` 个子进程。
 - `connect_timeout_s`、`query_timeout_s`：连接及查询超时。
 - `retries`：可重试错误的重试次数。
 - `max_partitions_per_sql`：一条 UNION ALL SQL 最多合并的分区数。

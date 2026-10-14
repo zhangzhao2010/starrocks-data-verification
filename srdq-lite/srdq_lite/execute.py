@@ -1,23 +1,29 @@
-"""Stages 4/5: run SQL tasks on both clusters concurrently, stream results to gzip files, resume-safe."""
+"""Stages 4/5: run SQL tasks on both clusters in worker processes, stream results to gzip files, resume-safe."""
 from __future__ import annotations
 
 import datetime as dt
 import decimal
 import gzip
 import logging
+import multiprocessing as mp
 import os
-import threading
+import signal
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from typing import Any
 
-from .config import RunSettings
+from .config import Cluster, RunSettings
 from .plan import SIDES, task_sides
 from .sr import ConnPool, SRError
 from .store import JsonlAppender, dumps, read_jsonl
 
 log = logging.getLogger("srdq_lite")
+
+# Row decoding is pure Python, so threads serialize on the GIL; processes use all cores.
+_CTX = mp.get_context("spawn")
+_worker: dict[str, Any] = {}
 
 
 def canon(v: Any) -> Any:
@@ -48,6 +54,71 @@ class _Abort(Exception):
     pass
 
 
+class _Forward(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        logging.getLogger(record.name).handle(record)
+
+
+def _init_worker(cluster: Cluster, run: RunSettings, session: dict[str, Any], slots, slot_counter, stop,
+                 log_queue) -> None:
+    # The parent handles Ctrl+C by killing running queries; workers must not die mid-write.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    log.handlers[:] = [QueueHandler(log_queue)]
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    with slot_counter.get_lock():
+        slot = slot_counter.value
+        slot_counter.value += 1
+    _worker.update(pool=ConnPool(cluster, run, session), run=run, slots=slots, slot=slot % len(slots), stop=stop)
+
+
+def _run_one(task: dict, side: str, phase: str, results_dir: Path) -> dict | None:
+    pool: ConnPool = _worker["pool"]
+    run: RunSettings = _worker["run"]
+    stop = _worker["stop"]
+    slots, slot = _worker["slots"], _worker["slot"]
+    if stop.is_set():
+        return None
+    final = result_file(results_dir, task["task_id"], side)
+    tmp = final.with_name(final.name + ".tmp")
+    t0 = time.time()
+    attempts = 0
+    while True:
+        attempts += 1
+        rows = 0
+        gen = None
+        try:
+            conn = pool.get()
+            slots[slot] = conn.connection_id
+            with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=3) as f:
+                gen = conn.stream(task[f"{side}_sql"])
+                for row in gen:
+                    rows += 1
+                    if task.get("max_rows") and rows > task["max_rows"]:
+                        raise _Abort(f"result exceeds {task['max_rows']} rows ({task.get('max_rows_note')})")
+                    f.write(dumps([canon(v) for v in row]))
+                    f.write("\n")
+            os.replace(tmp, final)
+            return _record(task, side, phase, "OK", attempts, rows, t0, None,
+                           str(final.relative_to(results_dir.parent)))
+        except _Abort as e:
+            pool.discard()
+            _close_quietly(gen)
+            return _record(task, side, phase, "FAILED", attempts, rows, t0, str(e), None)
+        except SRError as e:
+            pool.discard()
+            _close_quietly(gen)
+            if stop.is_set():
+                return None
+            if not e.retryable or attempts > run.retries:
+                return _record(task, side, phase, "FAILED", attempts, rows, t0, str(e), None)
+            log.warning("[%s] %s %s attempt %d failed, retrying: %s", phase, task["task_id"], side, attempts, e)
+            if stop.wait(min(30, 2 ** attempts)):
+                return None
+        finally:
+            slots[slot] = 0
+
+
 def run_tasks(tasks: list[dict], *, phase: str, results_path: Path, results_dir: Path,
               pools: dict[str, ConnPool], run: RunSettings, retry_failed: bool) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -68,60 +139,24 @@ def run_tasks(tasks: list[dict], *, phase: str, results_path: Path, results_dir:
     if not pending:
         return
 
-    stop = threading.Event()
-    active: dict[int, tuple[str, int]] = {}
-    active_lock = threading.Lock()
-
-    def one(task: dict, side: str) -> dict | None:
-        if stop.is_set():
-            return None
-        pool = pools[side]
-        final = result_file(results_dir, task["task_id"], side)
-        tmp = final.with_name(final.name + ".tmp")
-        t0 = time.time()
-        attempts = 0
-        while True:
-            attempts += 1
-            rows = 0
-            gen = None
-            try:
-                conn = pool.get()
-                with active_lock:
-                    active[threading.get_ident()] = (side, conn.connection_id)
-                with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=3) as f:
-                    gen = conn.stream(task[f"{side}_sql"])
-                    for row in gen:
-                        rows += 1
-                        if task.get("max_rows") and rows > task["max_rows"]:
-                            raise _Abort(f"result exceeds {task['max_rows']} rows ({task.get('max_rows_note')})")
-                        f.write(dumps([canon(v) for v in row]))
-                        f.write("\n")
-                os.replace(tmp, final)
-                return _record(task, side, phase, "OK", attempts, rows, t0, None,
-                               str(final.relative_to(results_dir.parent)))
-            except _Abort as e:
-                pool.discard()
-                _close_quietly(gen)
-                return _record(task, side, phase, "FAILED", attempts, rows, t0, str(e), None)
-            except SRError as e:
-                pool.discard()
-                _close_quietly(gen)
-                if stop.is_set():
-                    return None
-                if not e.retryable or attempts > run.retries:
-                    return _record(task, side, phase, "FAILED", attempts, rows, t0, str(e), None)
-                log.warning("[%s] %s %s attempt %d failed, retrying: %s", phase, task["task_id"], side, attempts, e)
-                if stop.wait(min(30, 2 ** attempts)):
-                    return None
-            finally:
-                with active_lock:
-                    active.pop(threading.get_ident(), None)
-
-    executors = {side: ThreadPoolExecutor(run.concurrency, thread_name_prefix=f"{phase}-{side}") for side in SIDES}
-    futures: set[Future] = {executors[side].submit(one, t, side) for t, side in pending}
+    stop = _CTX.Event()
+    log_queue = _CTX.Queue()
+    listener = QueueListener(log_queue, _Forward())
+    listener.start()
+    executors: dict[str, ProcessPoolExecutor] = {}
+    slots: dict[str, Any] = {}
+    for side in SIDES:
+        n = min(run.concurrency, sum(1 for _, s in pending if s == side))
+        if n:
+            slots[side] = _CTX.Array("q", n, lock=False)
+            p = pools[side]
+            executors[side] = ProcessPoolExecutor(
+                n, mp_context=_CTX, initializer=_init_worker,
+                initargs=(p.cluster, p.run, p.session, slots[side], _CTX.Value("i", 0), stop, log_queue))
     total, ok, failed = len(pending), 0, 0
     last_log = time.time()
     try:
+        futures: set[Future] = {executors[side].submit(_run_one, t, side, phase, results_dir) for t, side in pending}
         with JsonlAppender(results_path) as out:
             while futures:
                 finished, futures = wait(futures, timeout=5, return_when=FIRST_COMPLETED)
@@ -144,14 +179,15 @@ def run_tasks(tasks: list[dict], *, phase: str, results_path: Path, results_dir:
         stop.set()
         for ex in executors.values():
             ex.shutdown(wait=False, cancel_futures=True)
-        with active_lock:
-            running = list(active.values())
-        for side, cid in running:
-            pools[side].kill(cid)
+        for side, arr in slots.items():
+            for cid in list(arr):
+                if cid:
+                    pools[side].kill(cid)
         raise
     finally:
         for ex in executors.values():
             ex.shutdown(wait=True, cancel_futures=True)
+        listener.stop()
 
 
 def _close_quietly(gen) -> None:
