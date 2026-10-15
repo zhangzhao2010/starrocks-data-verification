@@ -1,0 +1,36 @@
+source:
+  host: source-fe.example.com
+  port: 9030
+  user: readonly_user
+  password_env: SR_SOURCE_PASSWORD
+  ssl: false
+
+target:
+  host: target-fe.example.com
+  port: 9030
+  user: readonly_user
+  password_env: SR_TARGET_PASSWORD
+  ssl: false
+
+check:
+  database: example_db
+  table: table_1
+  # 分区表填完整左闭右开时间范围；两端均未分区时改为 null 或省略。
+  partition: "partition[2026-09-29 00:00:00, 2026-09-30 00:00:00)"
+  # null 使用相同范围；未分区表保持 null，目标分区范围不同则填对应时间范围。
+  target_partition: null
+
+sampling:
+  block_rows: 1000
+  sample_rows: 10
+  # null 每次使用新随机种子；整数可在数据不变时复现样本。
+  seed: null
+
+run:
+  connect_timeout_s: 10
+  query_timeout_s: 7200
+  lookup_batch_rows: 200
+  output_dir: runs
+
+session:
+  time_zone: Asia/Shanghai
