@@ -11,7 +11,8 @@ from .sr import qi, qtable
 
 SIDES = ("source", "target")
 RULE_ORDER = {"ROW_COUNT": 0, "METRIC": 1, "SAMPLE": 2}
-LOOKUP_VALUES_PER_SQL = 10_000
+# Kept well under StarRocks max_scalar_operator_flat_children (10000), which also counts operators, columns and filters.
+LOOKUP_VALUES_PER_SQL = 5_000
 LOOKUP_ROW_FACTOR = 20
 _SHORT = {"source": "src", "target": "tgt"}
 _NUMERIC_KEY_CATS = {"int", "decimal", "bool"}

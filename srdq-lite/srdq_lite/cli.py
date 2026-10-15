@@ -31,6 +31,7 @@ GENERATED = ["01_connectivity.json", "02_metadata.jsonl", "03_tasks.jsonl", "04_
 
 
 def main(argv: list[str] | None = None) -> int:
+    started = time.time()
     p = argparse.ArgumentParser(prog="srdq_lite", description="Offline StarRocks source/target data comparison")
     p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -54,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _raise_interrupt)
     try:
         with RunLock(out):
-            return cmd_run(args, out) if args.cmd == "run" else cmd_report(out)
+            return cmd_run(args, out, started) if args.cmd == "run" else cmd_report(out)
     except (ConfigError, RuntimeError) as e:
         log.error("%s", e)
         return 2
@@ -76,7 +77,7 @@ def _setup_logging(out: Path) -> None:
         log.addHandler(h)
 
 
-def _init_run(out: Path, cfg: Config, specs: list[TableSpec], args) -> dict:
+def _init_run(out: Path, cfg: Config, specs: list[TableSpec], args, started: float) -> dict:
     path = out / "run.json"
     hashes = {"config_hash": canonical_hash(cfg.fingerprint()),
               "tables_hash": canonical_hash([s.to_dict() for s in specs])}
@@ -84,6 +85,9 @@ def _init_run(out: Path, cfg: Config, specs: list[TableSpec], args) -> dict:
         meta = read_json(path)
         same = all(meta.get(k) == v for k, v in hashes.items())
         if same and not args.replan:
+            if "sharding_time_cutoff_utc" not in meta:
+                raise ConfigError("existing run has no UTC sharding_time cutoff; use a new -o directory, "
+                                  "or --replan to archive the old results and start over")
             log.info("resuming run %s (created %s)", meta["run_id"], meta["created_at"])
             return meta
         if not args.replan:
@@ -96,8 +100,10 @@ def _init_run(out: Path, cfg: Config, specs: list[TableSpec], args) -> dict:
             if (out / name).exists():
                 shutil.move(str(out / name), str(dest / name))
         log.info("archived previous results to %s", dest)
+    cutoff = dt.datetime.fromtimestamp(int(started) - 3 * 3600, dt.timezone.utc)
     meta = {"run_id": out.name, "tool_version": __version__,
-            "created_at": dt.datetime.now().isoformat(timespec="seconds"), **hashes,
+            "created_at": dt.datetime.fromtimestamp(started).isoformat(timespec="seconds"),
+            "sharding_time_cutoff_utc": cutoff.strftime("%Y-%m-%d %H:%M:%S"), **hashes,
             "settings": cfg.fingerprint(), "config_file": str(Path(args.config).resolve()),
             "tables_file": str(Path(args.tables).resolve()), "table_ids": [s.id for s in specs]}
     write_json(path, meta)
@@ -105,11 +111,11 @@ def _init_run(out: Path, cfg: Config, specs: list[TableSpec], args) -> dict:
     return meta
 
 
-def cmd_run(args, out: Path) -> int:
-    started = time.time()
+def cmd_run(args, out: Path, started: float) -> int:
     cfg = load_config(args.config)
     specs = load_tables(args.tables)
-    meta = _init_run(out, cfg, specs, args)
+    meta = _init_run(out, cfg, specs, args, started)
+    log.info("[filter] sharding_time < '%s' (UTC), where the column exists", meta["sharding_time_cutoff_utc"])
 
     conn_info = [check_connectivity(c, cfg.run, cfg.session) for c in (cfg.source, cfg.target)]
     write_json(out / "01_connectivity.json", conn_info)
@@ -124,7 +130,7 @@ def cmd_run(args, out: Path) -> int:
     pools = {"source": ConnPool(cfg.source, cfg.run, cfg.session),
              "target": ConnPool(cfg.target, cfg.run, cfg.session)}
     try:
-        entries = _stage_metadata(out, cfg, specs, pools)
+        entries = _stage_metadata(out, cfg, specs, pools, meta["sharding_time_cutoff_utc"])
         tasks = plan_main(entries, cfg.run)
         write_jsonl(out / "03_tasks.jsonl", tasks)
         per_rule = Counter(t["rule"] for t in tasks)
@@ -154,7 +160,8 @@ def cmd_run(args, out: Path) -> int:
     return _report(out, meta, entries, tasks, conn_info, started)
 
 
-def _stage_metadata(out: Path, cfg: Config, specs: list[TableSpec], pools: dict[str, ConnPool]) -> list[dict]:
+def _stage_metadata(out: Path, cfg: Config, specs: list[TableSpec], pools: dict[str, ConnPool],
+                    sharding_time_cutoff_utc: str) -> list[dict]:
     path = out / "02_metadata.jsonl"
     done = {e["table_id"]: e for e in read_jsonl(path)}
     todo = [s for s in specs if s.id not in done or done[s.id]["meta_status"] == "ERROR"]
@@ -166,14 +173,14 @@ def _stage_metadata(out: Path, cfg: Config, specs: list[TableSpec], pools: dict[
             try:
                 src = fetch_table_meta(pools["source"].get(), spec.source_db, spec.source_table)
                 tgt = fetch_table_meta(pools["target"].get(), spec.target_db, spec.target_table)
-                return build_entry(spec, src, tgt)
+                return build_entry(spec, src, tgt, sharding_time_cutoff_utc=sharding_time_cutoff_utc)
             except SRError as e:
                 pools["source"].discard()
                 pools["target"].discard()
                 err = str(e)
                 if not e.retryable:
                     break
-        return build_entry(spec, None, None, error=err)
+        return build_entry(spec, None, None, error=err, sharding_time_cutoff_utc=sharding_time_cutoff_utc)
 
     if todo:
         with JsonlAppender(path) as w, ThreadPoolExecutor(cfg.run.concurrency, thread_name_prefix="meta") as ex:

@@ -67,6 +67,14 @@ class Connection:
         except (pymysql.MySQLError, OSError) as e:
             raise _wrap(e) from e
 
+    def query_dicts(self, sql: str, params: list | None = None) -> list[dict]:
+        try:
+            with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(sql, params)
+                return list(cur.fetchall()) if cur.description else []
+        except (pymysql.MySQLError, OSError) as e:
+            raise _wrap(e) from e
+
     def stream(self, sql: str, batch: int = 5000) -> Iterator[tuple]:
         try:
             with self.conn.cursor(pymysql.cursors.SSCursor) as cur:

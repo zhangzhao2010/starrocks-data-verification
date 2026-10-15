@@ -7,9 +7,11 @@ import time
 from typing import Any
 
 from .config import Cluster, Rule, RunSettings, TableSpec
-from .sr import Connection, SRError
+from .sr import Connection, SRError, qi, qtable
 
 _RANGE_KEYS_RE = re.compile(r"keys:\s*\[(.*?)\];")
+_LIST_GROUP_RE = re.compile(r"\(([^()]*)\)")
+_LIST_VALUE_RE = re.compile(r"'((?:[^'\\]|\\.)*)'|(-?\d+(?:\.\d+)?)")
 _INT_TYPES = {"tinyint", "smallint", "int", "integer", "bigint", "largeint"}
 _STRING_TYPES = {"char", "varchar", "string", "text"}
 _UNSUPPORTED_TYPES = {"hll", "bitmap", "percentile", "object", "unknown"}
@@ -63,20 +65,48 @@ def category(data_type: str, column_type: str) -> str:
     return t or "unknown"
 
 
+def _in_key(tuples: list[list]) -> str:
+    items = sorted(json.dumps(str(t[0]) if len(t) == 1 else [str(x) for x in t], ensure_ascii=False)
+                   for t in tuples)
+    return "IN (" + ", ".join(items) + ")"
+
+
+def _sql_list_values(text: str) -> list[str]:
+    return [a if a else b for a, b in _LIST_VALUE_RE.findall(text)]
+
+
 def normalize_partition_value(raw: str) -> str:
     raw = (raw or "").strip()
     keys = _RANGE_KEYS_RE.findall(raw)
     if len(keys) == 2:
         return f"[{keys[0].strip()}, {keys[1].strip()})"
+    # SHOW PARTITIONS (pre-3.x) renders list partitions as (('a'), ('b')) or ('a', 'b').
+    if raw.startswith("(") and raw.endswith(")"):
+        groups = _LIST_GROUP_RE.findall(raw[1:-1])
+        tuples = [_sql_list_values(g) for g in groups] if groups else [[v] for v in _sql_list_values(raw[1:-1])]
+        return _in_key(tuples) if tuples else raw
     try:
         vals = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return raw
     if isinstance(vals, list):
-        items = sorted(json.dumps(v[0] if isinstance(v, list) and len(v) == 1 else v, ensure_ascii=False)
-                       for v in vals)
-        return "IN (" + ", ".join(items) + ")"
+        return _in_key([v if isinstance(v, list) else [v] for v in vals])
     return raw
+
+
+def _partition_rows(conn: Connection, db: str, table: str) -> list[tuple]:
+    """(name, value, row_count) per non-temp partition; SHOW PARTITIONS covers versions without partitions_meta."""
+    try:
+        return conn.query("SELECT PARTITION_NAME, PARTITION_VALUE, ROW_COUNT FROM information_schema.partitions_meta "
+                          "WHERE DB_NAME = %s AND TABLE_NAME = %s AND IS_TEMP = 0", [db, table])
+    except SRError:
+        rows = conn.query_dicts(f"SHOW PARTITIONS FROM {qtable(db, table)}")
+    out = []
+    for r in rows:
+        value = next((str(r[c]).strip() for c in ("Range", "List", "ListValues")
+                      if r.get(c) is not None and str(r[c]).strip() not in ("", "-")), "")
+        out.append((r.get("PartitionName"), value, r.get("RowCount")))
+    return out
 
 
 def _split_keys(text: str) -> list[str]:
@@ -97,8 +127,7 @@ def fetch_table_meta(conn: Connection, db: str, table: str) -> dict:
         raw_model = str(cfg[0][0] or "").upper()
         model = _MODEL_ALIASES.get(raw_model, raw_model) or None
         keys, pkeys, buckets = _split_keys(cfg[0][1]), _split_keys(cfg[0][2]), cfg[0][3]
-    parts = conn.query("SELECT PARTITION_NAME, PARTITION_VALUE, ROW_COUNT FROM information_schema.partitions_meta "
-                       "WHERE DB_NAME = %s AND TABLE_NAME = %s AND IS_TEMP = 0", [db, table]) if cfg else []
+    parts = _partition_rows(conn, db, table) if cfg else []
     rows_total = sum(int(r[2] or 0) for r in parts)
     partitions = []
     if pkeys:
@@ -115,7 +144,8 @@ class RuleProblem(Exception):
         self.reason = reason
 
 
-def build_entry(spec: TableSpec, src: dict | None, tgt: dict | None, error: str | None = None) -> dict:
+def build_entry(spec: TableSpec, src: dict | None, tgt: dict | None, error: str | None = None,
+                *, sharding_time_cutoff_utc: str) -> dict:
     entry: dict[str, Any] = {
         "table_id": spec.id, "source_db": spec.source_db, "source_table": spec.source_table,
         "target_db": spec.target_db, "target_table": spec.target_table, "issues": [],
@@ -201,6 +231,14 @@ def build_entry(spec: TableSpec, src: dict | None, tgt: dict | None, error: str 
                 r["resolved"] = _resolve_metric(rule, col)
             else:
                 r["resolved"] = _resolve_sample(rule, src, col, issues)
+            if "sharding_time" in src_cols or "sharding_time" in tgt_cols:
+                time_col = col("sharding_time", "time filter")
+                flt = r["resolved"]["filter"] or {}
+                merged = {}
+                for side, key in (("source", "src"), ("target", "tgt")):
+                    time_filter = f"{qi(time_col[key])} < '{sharding_time_cutoff_utc}'"
+                    merged[side] = f"({flt[side]}) AND {time_filter}" if flt.get(side) else time_filter
+                r["resolved"]["filter"] = merged
         except RuleProblem as p:
             r.update(status=p.status, reason=p.reason)
             if p.status == "BLOCKED":
